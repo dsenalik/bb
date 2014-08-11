@@ -1,0 +1,924 @@
+#!/usr/bin/perl
+#----------------------------------------------------------#
+#        Author: Douglas Senalik dsenalik@wisc.edu         #
+#    http://www.vcru.wisc.edu/simonlab/sdata/software/     #
+#----------------------------------------------------------#
+# "Black Box" program series
+=bb
+Rearrange the order of sequences in a FASTA file
+=cut bb
+use strict;
+use warnings;
+use Getopt::Long;      # for getting command line parameters
+# version 1.0 Spetember 3, 2011
+# Version 1.1 September 3, 2011 - Add subrange feature to --seq
+#                                 Modify to work with scaffolds also
+
+
+
+############################################################
+# configuration variables
+############################################################
+my $version = "1.1";
+my $spacerlen = 20;
+my $defaultwrap = 100;
+my $defaultglobalprefix = "contig";
+
+
+
+############################################################
+# global variables
+############################################################
+my $ansiup    = "\033[1A";  # terminal control
+(my $prognopath = $0) =~ s/^.*[\/\\]//;
+my %inhdr = ();   # FASTA headers without ">", key is header up to first white space
+my %inseq = ();   # sequence
+my %inqhdr = ();  # quality headers without ">"
+my %inqseq = ();  # quality "sequence"
+my @originalorder = ();  # keys in original order
+my $doqual = 0;   # 1 if found and read in quality file
+my $outqualname = "";  # output quality file name ( if used )
+my $currbp = 0;   # current number of base pairs written, for $startstop
+my %excludehash = ();  # contigs to exclude, converted to hash for easy lookup
+my %seen;         # for --unique
+
+
+
+############################################################
+# command line parameters
+############################################################
+my @infilenames = ();   # input file name(s)
+my $outfilename = "";   # output file name
+my $append      = 0;    # append to existing output file
+my $coordinates = "";   # output file for coordinates, where each contig starts and ends
+my @seq         = ();   # sequences to keep
+my @exclude     = ();   # sequences to exclude
+my $globalprefix = $defaultglobalprefix;
+my $help        = 0;    # print help and exit
+my $oneseq;             # to concatenate all sequences, and optional header
+my $annotate    = 0;    # extra information in header
+my $startstop   = 0;    # put start and stop coordinates in file
+my $noqual      = 0;    # do not attempt to include qual file
+my $blankline   = 0;    # blank line between sequences in --onesequence mode
+my $random      = 0;    # return this many random contigs
+my $trim        = 0;    # trim header after first white space
+my $flank       = 0;    # flanking sequence
+my $replace;            # for search and replace
+my $with;               # for search and replace
+my $wrap;               # wrap all lines to uniform length, negative=one long line, 0=default length, undefined disables
+my $makeunique;         # all fasta headers must be unique, so if not, append a copy number
+my $quiet       = 0;    # only show errors
+my $debug       = 0;    # print extra debugging information
+GetOptions (
+            "infile=s"       => \@infilenames,       # string
+            "outfile=s"      => \$outfilename,       # string
+            "coordinates=s"  => \$coordinates,       # string
+            "sequence=s"     => \@seq,               # string array
+            "exclude=s"      => \@exclude,           # string array
+            "onesequence:s"  => \$oneseq,            # flag/string
+            "prefix:s"       => \$globalprefix,      # flag/string
+            "annotate"       => \$annotate,          # flag
+            "startstop"      => \$startstop,         # flag
+            "noqual"         => \$noqual,            # flag
+            "blankline"      => \$blankline,         # flag
+            "append"         => \$append,            # flag
+            "trim"           => \$trim,              # flag
+            "flank=i"        => \$flank,             # integer
+            "random=i"       => \$random,            # integer
+            "wrap:i"         => \$wrap,              # flag/integer
+            "unique"         => \$makeunique,        # flag
+            "replace=s"      => \$replace,           # string
+            "with:s"         => \$with,              # string
+            "help"           => \$help,              # flag
+            "quiet"          => \$quiet,             # flag
+            "debug"          => \$debug);            # flag
+unless ( scalar @infilenames ) { $help = 1; }
+unless ( $outfilename ) { $help = 1; }
+if ( ( ( scalar @seq ) + ( scalar @exclude ) + $random ) < 1 ) { $help = 1; }
+if ( ( defined $wrap ) and ( $wrap == 0 ) ) { $wrap = $defaultwrap; }
+# debug implies not quiet
+if ( $debug ) { $quiet = 0; }
+
+
+
+############################################################
+# print help screen
+############################################################
+if ( $help )
+  {
+    print "$prognopath  Version $version
+
+Rearrange the order of sequences in a FASTA file based on
+your specified contigs and orientations
+
+Required parameters:
+  --infile=xxx      input FASTA file name(s) with multiple sequences
+  --outfile=xxx     output file name, or \"-\" for stdout
+  --seq=xxx         sequences to keep, multiple allowed, a plus
+                    \"+\" for forward orientation is optional, 
+                    or use \"-\" anywhere to indicate reverse
+                    complement. Use \"..\" to indicate a range.
+                    Use \",\" to separate entries. Examples:
+                    --seq=contig45 --seq=46,49,-21..23
+                    --seq=+32 --seq=-65 --seq=76-
+                    --seq=00021..45- -seq=45+..47
+                    or use \"s\" for a spacer of $spacerlen Ns
+                    e.g. --seq=00021+,S,45-  Follow S by a
+                    different length, if desired, e.g. ...,S100,...
+                    disable or change the $defaultglobalprefix prefix with --prefix
+                    You can also extract a subset of a contig using
+                    colon dividers, specifying start and stop,
+                    e.g. --seq=12:100:200 The subrange is taken
+                    before reverse complementing, if so indicated
+                    --seq=xx:-100 returns the last 100 b.p.
+                    1:-1 is the whole string, -1:-1 is the last char
+                    The --seq parameter may be omitted if --exclude
+                    or --random is used instead
+Optional parameters:
+  --prefix[=xxx]    if --seq uses only a number, this text will be
+                    prefixed to the contig name. Default value = \"$defaultglobalprefix\"
+                    use --prefix without a value to disable
+  --exclude=xxx     use this in place of the --seq parameter to
+                    output all contigs except these. Order will be
+                    unchanged from the original file in this case.
+  --random=xxx      return this many sequences selected at random
+                    and placed in random order
+  --coordinates=xxx create this additional output file, which has
+                    the starting and ending position of each contig
+  --onesequence[=xxx] concatenate all sequences into one. If a value
+                    is specified, that is used as the header.
+                    use --trim to inhibit supplemental info
+  --annotate        if --onesequence used, put extra information in
+                    header: sequence lengths
+  --startstop       add starting and ending base position
+                    to FASTA headers
+  --blankline       for --onesequence mode, put a blank line
+                    between each sequence
+  --trim            trim header after first white space
+  --flank           when using subrange, add this much flanking sequence
+                    on each side
+  --wrap[=xxx]      wrap sequence lines to this length, if value not
+                    specified, use $defaultwrap; any negative value
+                    returns a single line of sequence
+  --append          append to existing --outfile
+  --noqual          if a .qual file is present, a corresponding
+                    output .qual file is created. This flag
+                    turns off this quality file processing
+  --unique          insure that all FASTA headers are unique by
+                    appending a number if seen more than once
+  --replace=xxx     search and replace regex
+  --with[=xxx]      replace string, or undefined for delete
+  --help            print this screen
+  --quiet           only print error messages
+  --debug           print extra debugging information
+";
+    exit 1;
+  } # if ( $help )
+
+
+
+############################################################
+# expand ranges in specified sequences
+############################################################
+@seq = expandseq ( "--seq", @seq );
+@exclude = expandseq ( "--exclude", @exclude );
+
+# convert excludes to a hash for easy lookup
+foreach my $anexclude ( @exclude )
+  {
+    $anexclude =~ s/^\-//g;  # remove directional information for excludes
+    $excludehash{$anexclude} = 1;
+  } # foreach my $anexclude ( @exclude )
+
+
+
+############################################################
+# read input file into hash
+############################################################
+foreach my $infilename ( @infilenames )
+  {
+    debugmsg ( "Reading input file \"$infilename\"" );
+    my $currcontig = 0;
+    my $nlines = 0;
+    my $nheaders = 0;
+    my $INF = stdopen ( "<", $infilename );
+    my $currkey;
+    while ( my $aline = <$INF> )
+      {
+        $nlines++;
+        $aline =~ s/[\r]//g;  # remove DOS returns
+        if ( $aline =~ m/^>(.*)$/ )
+          {
+            my $hdr = $1;
+            $nheaders++;
+            $hdr =~ s/[\s\n]+$//g;  # header remove newlines and trailing white space
+            if ( $trim ) { $hdr =~ s/\s.*//; }
+            ( $currkey = $hdr ) =~ s/\s.*$//;  # header up to first white space
+            # remove internal leading zeros in key, e.g. contig00001 becomes contig1
+            $currkey =~ s/^([^\d]*)0+/$1/;
+            $inhdr{$currkey} = $hdr;  # ">" has been removed
+            push ( @originalorder, $currkey );
+            if ( ( scalar keys %inhdr ) <= 10 ) { debugmsg ( "Reading in sequence with key \"$currkey\", header \"$hdr\"" ); }
+          }
+        else
+          {
+            $inseq{$currkey} .= $aline;  # retains newlines
+          }
+      } # while <$INF>
+    stdclose ( $INF );
+    unless ( $quiet )
+      { print "Input file read, " . commify($nlines) . " lines, " . commify($nheaders) . " sequences\n"; }
+
+
+
+############################################################
+# read quality file into array
+############################################################
+    unless ( $noqual )
+      {
+        my $inqualname = qualname( $infilename );
+        if ( -e $inqualname )
+          {
+        debugmsg ( "Reading input quality file \"$inqualname\"" );
+        my $currcontig = 0;
+        my $nlines = 0;
+        my $nheaders = 0;
+        my $contigindex = 0;
+        my $INF = stdopen ( "<", $inqualname, "quality" );
+        while ( my $aline = <$INF> )
+          {
+            $nlines++;
+            $aline =~ s/[\r]//g;  # remove DOS returns
+            if ( $aline =~ m/^>(.*)$/ )
+              {
+                my $hdr = $1;
+                $contigindex++;
+                $nheaders++;
+                $hdr =~ s/[\s\n]+$//g;  # header remove newlines and trailing white space
+                if ( $trim ) { $hdr =~ s/\s.*//; }
+                ( $currkey = $hdr ) =~ s/\s.*$//;  # header up to first white space
+                # remove internal leading zeros in key, e.g. contig00001 becomes contig1
+                $currkey =~ s/^([^\d]*)0+/$1/;
+                $inqhdr{$currkey} = $hdr;  # ">" has been removed
+                if ( ( scalar keys %inqhdr ) <= 10 ) { debugmsg ( "Reading in quality with key \"$currkey\", header \"$hdr\"" ); }
+              }
+            else
+              {
+                $inqseq{$currkey} .= $aline;  # retains newlines
+              }
+          } # while <$INF>
+        stdclose ( $INF );
+        unless ( $quiet )
+          { print "Quality file read, " . commify($nlines) . " lines, " . commify($nheaders) . " sequences\n"; }
+        $doqual = 1;
+      } # if quality file found
+    else  # no quality file found
+      {
+        unless ( $quiet ) { print "No corresponding quality file \"$inqualname\" found\n"; }
+      } # else no quality file found
+    } # unless ( $noqual )
+  } # foreach $infilename
+
+
+
+############################################################
+# random mode, create list of contigs
+############################################################
+if ( $random )
+  {
+#    # create a new list of just defined contig indices ( some contig numbers may be blank )
+#    my @definedcontigs = ();
+#    for ( my $i=0; $i<=$#inhdr; $i++ )
+#      {
+#        if ( defined($inhdr[$i]) )
+#          { push ( @definedcontigs, $i ) }
+#      } # for $i
+
+    # test to prevent getting more random contigs than are available
+    if ( ( scalar keys %inhdr ) < $random )
+      { die "Error, requested more random contigs (".commify($random).") than are in the input file (".commify(scalar keys %inhdr).")\n"; }
+
+    # pick a contig at random until we have enough
+    my @allkeys = keys %inhdr;
+    for my $i ( 1 .. $random )
+      {
+        # select a random contig and save it to the @seq list
+        my $randomindex = int(rand(@allkeys));
+        my $key = $allkeys[$randomindex];
+        debugmsg ( "Selecting random contig \"$key\"" );
+        push ( @seq, $key );
+
+        # remove selected contig from array to prevent re-use
+        splice ( @allkeys, $randomindex, 1 );
+
+      } # for $i
+
+  } # if ( $random )
+
+
+
+############################################################
+# create output file
+############################################################
+{
+debugmsg ( "Creating output FASTA file \"$outfilename\"" );
+my $outfdata = "";
+my $outqdata = "";
+my @coordinatesdata = ();
+my $currposition = 1;
+my $nseq = 0;
+my $nlines = 0;
+my $OUTF = stdopen ( $append?">>":">", $outfilename );
+my $OUTQ;
+if ( $doqual )
+  {
+    $outqualname = qualname( $outfilename );
+    debugmsg ( "Creating output quality file \"$outqualname\"" );
+    $OUTQ = stdopen ( $append?">>":">", $outqualname, "quality" );
+  }
+
+
+
+############################################################
+# --seq mode
+############################################################
+foreach my $aseqnum ( @seq )
+  {
+    # save full string for --annotation
+    my $ann = $aseqnum;
+
+    # remove subrange values if present
+    my @range = split ( /:/, $aseqnum );
+    $aseqnum = $range[0];
+
+    # strip off reverse complement flag if present
+    my $rc = 0;
+    if ( $aseqnum =~ m/-/ ) { $rc = 1; }
+    $aseqnum =~ s/-//g;
+
+    # check for special spacer
+    unless ( $aseqnum =~ m/^S\d*$/i )
+      {
+        # check validity of number
+        unless ( defined $inseq{$aseqnum} )
+          { die "Error, no such sequence \"$aseqnum\"\n"; }
+
+        # skip this one if it is on the exclude list
+        if ( $excludehash{$aseqnum} )
+          {
+            debugmsg ( "Specified sequence \"$aseqnum\" is on the exclude list, skipping it" );
+            next;
+          }
+      }
+
+    # get relevant sequence
+    my $aseq;
+    my $aqual = "";
+    if ( $aseqnum =~ m/^S(\d*)$/i )
+      {
+        my $Nlen = $1;
+        unless ( $Nlen ) { $Nlen = $spacerlen; }
+        $aseq = "N"x$Nlen; 
+        if ( $doqual ) { $aqual = "00 "x$Nlen; }  # not tested this may be wrong @@@
+      }
+    else
+      {
+        $aseq = $inseq{$aseqnum};
+        if ( $doqual ) { $aqual = $inqseq{$aseqnum}; }
+      }
+
+    # calculate sequence length for --startstop and for statistics line at end
+    my $seqlen = 0;
+    my $bseq = $aseq;
+    $bseq =~ s/[^A-Za-z]//g;
+    $seqlen = length ( $bseq );
+
+    # trim sequence and quality if subrange was specified
+    if ( ( $range[1] ) or ( $range[2] ) )
+      {
+        # validity checking
+        if ( ( $range[1] ) and ( $range[1] !~ m/^[\d\-]*$/ ) ) { die "Error, invalid character in subrange \"$range[1]\" for sequence $aseqnum is > sequence length $seqlen\n"; }
+        if ( ( $range[2] ) and ( $range[2] !~ m/^[\d\-]*$/ ) ) { die "Error, invalid character in subrange \"$range[2]\" for sequence $aseqnum is > sequence length $seqlen\n"; }
+
+        # e.g. 1:-1 is the whole string, -1:-1 is the last 1 character
+        unless ( $range[1] ) { $range[1] = 1; }
+        if ( $range[1] < 0 )  # i.e. right trim when negative start point
+          { $range[1] = $seqlen + $range[1] + 1; }  # remember that $range[1] is negative here
+        unless ( $range[2] ) { $range[2] = $seqlen; }
+        if ( $range[2] < 0 )  # i.e. right trim when negative start point
+          { $range[2] = $seqlen + $range[2] + 1; }  # remember that $range[2] is negative here
+
+        # range checking
+        if ( $range[1] > $seqlen ) { die "Error, start coordinate $range[1] for sequence $aseqnum is > sequence length $seqlen\n"; }
+        if ( $range[2] > $seqlen ) { die "Error, end coordinate $range[2] for sequence $aseqnum is > sequence length $seqlen\n"; }
+
+        # flanking sequence
+        if ( $flank )
+          {
+            $range[1] -= $flank;
+            if ( $range[1] < 1 ) { $range[1] = 1; }
+            $range[2] += $flank;
+            if ( $range[2] > $seqlen ) { $range[2] = $seqlen; }
+          }
+
+        $seqlen = ( $range[2] - $range[1] + 1 );
+        my $newseq = "";
+        my $i = 0;
+        while ( $aseq =~ m/([A-Za-z][^A-Za-z]*)/g )
+          {
+            $i++;
+            if ( $i >= $range[1] )
+              {
+                if ( $i <= $range[2] )
+                  { $newseq .= $1; }
+                else
+                  { last; }
+              }
+          }
+        $aseq = $newseq;
+        my $newqual = "";
+        $i = 0;
+        if ( $doqual )
+          {
+            while ( $aqual =~ m/(\d{2}[^\d]*)/g )
+              {
+                $i++;
+                if ( $i >= $range[1] )
+                  {
+                    if ( $i <= $range[2] )
+                      { $newseq .= $1; }
+                    else
+                      { last; }
+                  }
+              }
+            $aqual = $newqual;
+          } # if ( $doqual )
+
+      } # if subrange was specified
+
+    # annotation
+    $ann .= "(" . ($seqlen) . 'nt@' . ($currposition) . "-" . ($currposition+$seqlen-1) . ")";
+    debugmsg ( "Adding sequence \"$aseqnum\" " . ($rc?"=ReverseComplement":"") . ", " . commify($seqlen) . " b.p." );
+
+    # strip leading and trailing white space from sequence
+    $aseq =~ s/^\s+//;
+    $aseq =~ s/\s+$//;
+    if ( $doqual )
+      {
+        $aqual =~ s/^\s+//;
+        $aqual =~ s/\s+$//;
+      }
+
+    # reverse complement it if appropriate
+    if ( $rc )
+      {
+        $aseq = revcomp ( $aseq );
+        if ( $doqual ) { $aqual = qualrev ( $aqual ); }
+      }
+
+    # store contig coordinates
+    if ( $coordinates )
+      {
+        push ( @coordinatesdata, join ( "\t", $aseqnum, $rc?"-":"+", $currposition, ( $currposition+$seqlen-1 ) ) );
+      }
+    $currposition += $seqlen;
+
+    # print header to ouput ( unless concatenating )
+    $nseq++;
+    unless ( defined $oneseq )
+      {
+        if ( $aseqnum !~ m/^S\d*$/i )  # skip spacer for multi-sequence mode
+          {
+            unless ( defined $inhdr{$aseqnum} ) { die "Error, undefined header for sequence number \"$aseqnum\", sequence index $nseq\n"; }
+            my $thishdr = ">" . replacewith($inhdr{$aseqnum});
+            if ( $makeunique )
+              {
+                $seen{$inhdr{$aseqnum}}++;
+                if ( $seen{$inhdr{$aseqnum}} > 1 )
+                  { $thishdr .= "." . $seen{$inhdr{$aseqnum}}; }
+              }
+            if ( $startstop )
+              { $thishdr .= " " . ($currbp+1) . ".." . ($currbp+$seqlen); }
+            # append " RC" to end of FASTA header if we reverse complemented it
+            if ( $rc )
+              { $thishdr .= " RC"; }
+            $thishdr .= "\n";
+            $outfdata .= $thishdr;
+            $nlines++;
+            if ( $doqual )
+              { $outqdata .= $thishdr; }
+          }
+      }
+    if ( $startstop ) { $currbp += $seqlen; }
+
+    # print sequence to output, and follow with a return
+    $outfdata .= $aseq . "\n";
+    if ( $blankline ) { $outfdata .= "\n"; }
+    $nlines += ( $aseq =~ tr/\n// + 1 );
+    if ( $doqual )
+      {
+        $outqdata .= $aqual . "\n";
+        if ( $blankline ) { $outqdata .= "\n"; }
+      }
+
+    if ( $annotate )
+      { $aseqnum = $ann }
+  } # foreach my $aseqnum ( @seq )
+
+
+
+############################################################
+# --exclude mode
+############################################################
+if ( ( scalar @exclude ) and ( ! scalar @seq ) )  # if both --seq and --exclude were specified, we are done already
+  {
+    # loop through all input sequences in their original order
+    foreach my $key ( @originalorder )
+      {
+        # skip undefined sequences
+        next unless ( defined $inhdr{$key} );
+
+        # skip if on the exclude list
+        if ( $excludehash{$key} )
+          {
+            debugmsg ( "Sequence \"$key\" is on the exclude list, skipping it" );
+            next;
+          }
+
+        # get relevant sequence
+        my $aseq = $inseq{$key};
+        my $aqual = "";
+        if ( $doqual ) { $aqual = $inqseq{$key}; }
+
+        debugmsg ( "Adding sequence $key, " . commify(length($aseq)) . " b.p." );
+
+        # strip leading and trailing white space from sequence
+        $aseq =~ s/^\s+//;
+        $aseq =~ s/\s+$//;
+        if ( $doqual )
+          {
+            $aqual =~ s/^\s+//;
+            $aqual =~ s/\s+$//;
+          }
+
+        # calculate sequence length for --startstop and for statistics line at end
+        my $seqlen = 0;
+        my $bseq = $aseq;
+        $bseq =~ s/[^A-Za-z]//g;
+        $seqlen = length ( $bseq );
+        if ( $coordinates )
+          {
+            push ( @coordinatesdata, join ( "\t", $key, "+", $currposition, ( $currposition+$seqlen-1 ) ) );
+          }
+        $currposition += $seqlen;
+
+        # print header to ouput ( unless concatenating )
+        $nseq++;
+        unless ( defined $oneseq )
+          {
+            $outfdata .= ">" . replacewith($inhdr{$key});
+            if ( $startstop )
+              { $outfdata .= " " . ($currbp+1) . ".." . ($currbp+$seqlen); }
+            $outfdata .= "\n";
+            $nlines++;
+            if ( $doqual )
+              {
+                $outqdata .= ">" . replacewith($inqhdr{$key});
+                if ( $startstop )
+                  { $outqdata .= " " . ($currbp+1) . ".." . ($currbp+$seqlen); }
+                $outqdata .= "\n";
+              }
+          }
+        if ( $startstop ) { $currbp += $seqlen; }
+
+        # print sequence to output, and follow with a return
+        $outfdata .= $aseq . "\n";
+        if ( $blankline ) { $outfdata .= "\n"; }
+        $nlines += ( $aseq =~ tr/\n// + 1 );
+        if ( $doqual )
+          {
+            $outqdata .= $aqual . "\n"; 
+            if ( $blankline ) { $outqdata .= "\n"; }
+          }
+      } # for $key
+  } # if ( ( scalar @exclude ) and ( ! scalar @seq ) )
+
+
+
+############################################################
+# if --oneseq mode, print header now
+############################################################
+if ( defined $oneseq ) 
+  {
+    my $header = "";
+    if ( $oneseq )
+      { $header = $oneseq; }
+    else
+      { $header = "concatenated"; }
+    unless ( $trim )
+      { $header .= " ".scalar(@seq)." sequences: ".join ("+", @seq); }
+    print $OUTF ">", $header, "\n";
+    if ( $doqual ) { print $OUTQ ">", $header, "\n"; }
+  }
+
+
+
+############################################################
+# print saved data to output file
+############################################################
+print $OUTF wrapper($outfdata);
+stdclose ( $OUTF );
+unless ( $quiet )
+  {
+    print "Output file created, " . commify($nlines) . " lines, " . commify($nseq) . " sequences, ".commify($currposition-1)." b.p.\n";
+    if ( $annotate ) { debugmsg ( "++ " . join ( "\n++ ", @seq ) ); }
+  }
+if ( $doqual )
+  {
+    print $OUTQ wrapper($outqdata);
+    stdclose ( $OUTQ );
+  }
+
+if ( $coordinates )
+  {
+    debugmsg ( "Storing coordinates data to file \"$coordinates\"" );
+    my $OUTC = stdopen ( ">", $coordinates );
+    print $OUTC join ( "\n", @coordinatesdata ), "\n";
+    stdclose ( $OUTC );
+    unless ( $quiet )
+      { print "Coordinates file created, " . commify(scalar @coordinatesdata) . " lines\n"; }
+  } # if ( $coordinates )
+}
+
+
+
+exit 0;
+
+
+
+############################################################
+sub wrapper { my ( $sequence ) = @_;
+############################################################
+if ( $wrap )
+  {
+    my $wrappedseq = "";
+    my $currseq = "";
+    foreach my $aline ( split ( /\n/, $sequence ) )
+      {
+        if ( $aline =~ m/^>/ )
+          {
+            if ( $wrap > 0 )
+              { $currseq =~ s/(.{$wrap})/$1\n/g; }
+            else
+              { $currseq =~ s/[\r\n]//g; }
+            if ( $currseq )
+              {
+                $wrappedseq .= $currseq;
+                unless ( $wrappedseq =~ m/\n$/ ) { $wrappedseq .= "\n"; }
+              }
+            $currseq = "";
+            $wrappedseq .= $aline . "\n";  # header line
+          }
+        else
+          {
+            if ( $wrap ) { $aline =~ s/\s//g; }  # remove extra white space in any wrap mode
+            $currseq .= $aline;
+          }
+      } # foreach $aline
+    if ( $currseq )  # last sequence in file
+      {
+        if ( $wrap > 0 )
+          { $currseq =~ s/(.{$wrap})/$1\n/g; }
+        else
+          { $currseq =~ s/[\r\n]//g; }
+        $wrappedseq .= $currseq;
+        unless ( $wrappedseq =~ m/\n$/ ) { $wrappedseq .= "\n"; }
+      }
+    return $wrappedseq;
+  }
+else
+  { return $sequence; }
+} # sub wrapper
+
+
+
+############################################################
+sub replacewith { my ( $text ) = @_;
+############################################################
+  if ( defined $replace )
+    {
+      if ( length($replace) == 0 )
+        { die "Error, --replace string is zero length\n"; }
+      if ( length($with//"") )
+        { $text =~ s/$replace/$with/; }
+      else  # delete
+        { $text =~ s/$replace//; }
+    }
+  return $text;
+} # sub replacewith
+
+
+
+############################################################
+sub expandseq { my ( $debugtxt, @unexpanded ) = @_;
+############################################################
+# expand --seq or --exclude parameter ranges
+# After parsing, all entries will be an optional "-" followed
+# by contig number with leading zeroes stripped off
+# e.g. 456 or -678
+# if a subrange was indicated, that is still present unchanged
+my @expanded = ();
+my $index = 0;  # for debug message
+foreach my $aseq ( @unexpanded )
+  {
+    $index++;
+    if ( $index <= 10 ) { debugmsg ( "Parsing sequence \"$aseq\"" ); }
+    # split at commas or white space
+    foreach my $asubseq ( split ( /[,\s]+/, $aseq ) )
+      {
+        # skip null items
+        next unless ( $asubseq );
+
+        # remove subrange info and store separately
+        my @range = split ( /:/, $asubseq );
+        $asubseq = $range[0];
+        my $subrange = "";
+        if ( defined $range[1] ) { $subrange .= ":" . $range[1]; }
+        if ( defined $range[2] ) { $subrange .= ":" . $range[2]; }
+
+        # save reverse complement flag
+        my $revcomp = "";
+        if ( $asubseq =~ m/-/ ) { $revcomp = "-"; }
+
+        # remove "-" or "+"
+        $asubseq =~ s/[\-\+]//g;
+
+        # expand ranges
+        if ( $asubseq =~ m/^(.*)(\d+)\.\.([^:]*)(\d+)/ )
+          {
+            ( my $start = $2 ) =~ s/^0+//;
+            ( my $end = $4 ) =~ s/^0+//;
+            my $prefix = $1;
+            unless ( $prefix ) { $prefix = $globalprefix; }
+            for ( my $i=$start; $i<=$end; $i++ )
+              {
+                my $fullid = $revcomp.$prefix.$i.$subrange;
+                push ( @expanded, $fullid );
+                if ( $index <= 10 ) { debugmsg ( "  Saving expanded sequence \"$fullid\"" ); }
+              }
+          }
+        elsif ( $asubseq =~ m/^S$/i )
+          {
+            push ( @expanded, $asubseq );
+            if ( $index <= 10 ) { debugmsg ( "  Saving single spacer \"$asubseq\"" ); }
+          }
+        else  # single contig
+          {
+            my $prefix = "";
+            my $number = "";
+            if ( $asubseq =~ m/^([^\d]*)(\d+)$/ )
+              {
+                $prefix = $1;
+                $number = $2;
+              }
+            else
+              { $prefix = $asubseq; }
+            unless ( $prefix ) { $prefix = $globalprefix; }
+            # trim leading zeroes
+            $number =~ s/^0+//;
+            my $fullid = $revcomp.$prefix.$number.$subrange;
+            push ( @expanded, $fullid );
+            if ( $index <= 10 ) { debugmsg ( "  Saving single contig \"$fullid\"" ); }
+          }
+      } # foreach my $asubseq
+  } # foreach my $aseq ( @unexpanded )
+debugmsg ( "Original $debugtxt array contained ".commify(scalar(@unexpanded))." items, after expansion it contains ".commify(scalar(@expanded))." items" );
+return @expanded;
+} # sub expandseq
+
+
+
+############################################################
+sub debugmsg { my ( $text, $noreturn, $nolinenum ) = @_;
+############################################################
+  if ( $debug )
+    {
+      my ($package, $filename, $line, $sub) = caller(0);
+      unless ( $nolinenum ) { $text = "Line $line: " . $text; }
+      if ( ! ( $noreturn ) ) { $text .= "\n"; }
+      print $text;
+    } # if ( $debug )
+} # sub debugmsg
+
+
+
+###############################################################
+sub timestr {
+###############################################################
+  @_ = localtime(shift || time);
+  return(sprintf("%04d/%02d/%02d %02d:%02d", $_[5]+1900, $_[4]+1, $_[3], @_[2,1]));
+} # sub timestr
+
+
+
+###############################################################
+sub commify {
+###############################################################
+# http://perldoc.perl.org/perlfaq5.html#How-can-I-output-my-numbers-with-commas
+  local $_ = shift;
+  1 while s/^([-+]?\d+)(\d{3})/$1,$2/;
+  return $_;
+} # commify
+
+
+
+############################################################
+sub qualname { my ( $fastaname ) = @_;
+############################################################
+# convert a FASTA file name to the corresponding quality file name
+  my $qualname = $fastaname;
+  $qualname =~ s/\.[^\.]+$//;  # remove existing extension whatever it is
+  $qualname .= ".qual";        # replace with ".qual";
+} # sub qualname
+
+
+
+############################################################
+sub revcomp { my ( $dna ) = @_;
+############################################################
+# standard DNA reverse complement, including degenerate bases
+  my $revcomp = reverse ( $dna );
+  $revcomp =~ tr/AaCcTtGgMmRrYyKkVvHhDdBb/TtGgAaCcKkYyRrMmBbDdHhVv/;
+  return $revcomp;
+} # sub revcomp
+
+
+
+############################################################
+sub qualrev { my ( $qual ) = @_;
+############################################################
+# reverse quality score order, retain returns in string
+  $qual =~ s/\n/ \n /g;  # space on both sides of return so we can retain them
+  # convert to array, some elements will be returns, and reverse the order
+  my @qualarr = reverse( split ( /[ \t]+/, $qual ) );
+  # convert back to string, space between values
+  $qual = join ( " ", @qualarr );
+  # remove extra spaces around returns that we introduced earlier
+  $qual =~ s/ *\n *//g;
+  return $qual
+} # sub revcomp
+
+
+
+###############################################################
+sub stdopen { my ( $mode, $filename, $extratext ) = @_;
+###############################################################
+# a replacement for the three-parameter open which also allows
+# the use of "-" as the file name to mean STDIN or STDOUT
+  my $fh;  # the file handle
+  if ( $filename eq "-" )  # only exact match to "-" has special meaning
+    {
+      if ( $mode =~ m/>/ )
+        { $fh = *STDOUT }
+      else
+        { $fh = *STDIN }
+    }
+  else
+    {
+      # supplemental passed text for error messages, need one more space
+      if ( defined $extratext )
+        { $extratext .= " " }
+      else
+        { $extratext = "" }
+
+      my $text;  # this is only used for error message
+      if ( $mode =~ m/^\+?>>/ )  # ">>" or "+>>"
+        { $text = "append" }
+      elsif ( $mode =~ m/^\+?>/ )  # ">" or "+>"
+        { $text = "output" }
+      elsif ( $mode =~ m/^\+?</ )  # "<" or "+<"
+        { $text = "input" }
+      else
+        { die "Error, unsupported file mode \"$mode\" specified to stdopen( $mode, $filename, $extratext )\n"; }
+      open ( $fh, $mode, $filename ) or die ( "Error opening ${extratext}file \"$filename\" for $text: $!\n" );
+    }
+  # return the opened file handle to the caller
+  return $fh;
+} # stdopen
+
+
+
+###############################################################
+sub stdclose { my ( $fh ) = @_;
+###############################################################
+# same as built-in close, except in case of STDIN or STDOUT,
+# and in this case the file handle is not closed
+
+  unless ( fileno($fh) <= 2 )  # if file number is this low, is stdin or stdout or stderr
+    { close ( $fh ) or die ( "Error closing file handle: $!\n" ); }
+
+} # sub stdclose
+
+
+
+# eof

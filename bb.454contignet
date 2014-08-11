@@ -1,0 +1,1538 @@
+#!/usr/bin/perl
+#-------------------------------------------------------------------------#
+#               Author: Douglas Senalik dsenalik@wisc.edu                 #
+#  http://www.vcru.wisc.edu/simonlab/sdata/software/index.html#contignet  #
+#	Modified by: Simon Gladman simon.gladman@csiro.au		  #
+#				2011					  #
+#-------------------------------------------------------------------------#
+# "Black Box" program series
+=bb
+Create a network of all interconnected 454 contigs
+=cut bb
+use strict;
+use warnings;
+use Getopt::Long;      # for getting command line parameters
+
+# 1.0.1 - Dec 29, 2010
+# 1.0.2 - Feb 15, 2011 - removed extra line that prevented count of nodes from working
+# 1.0.3 - Mar 12, 2011 - Support paired end data output files, add "@" prefix for list files,
+#                        add --nospline and --overlapmode parameters
+# 1.0.3-Simon - May 18, 2011 - Added pseudo-links formed by paired end information instead of just
+#						 newbler links	
+# 1.0.4 - September 2, 2011
+#         Allow "+" or "-" in contig numbers, but it is ignored
+#         Add parameter to specify output image type
+#         Correct error in --tag help description
+#         Add --label as a synonym for --tag
+#         Fix bug in dead end and recursion limit labeling
+# 1.0.5 - October 18, 2011
+#         Allow keeping graphviz command file
+#         change default overlap mode to "false" (it was "none" before)
+#         to have same default output with newest version of neato
+#         make scaffold connections optional, add --scaffold to use scaffold connections
+# 1.0.6 - November 4, 2011
+#         Filter out null contigs, excludes, etc. from command line
+#         Optional ABySS-Explorer output file added
+# 1.0.7 - May 4, 2012
+#         Text output data file is now sorted by contig number
+#         change the --scaffold parameter to --pairlinks,
+#           since I may use --scaffold in the future for the actual scaffold section
+#         Show paired end links and labels ( --pairlinks ) in a different color
+#         Add support for flowthrough links ( --flowthrough ) in a third color
+#         Add support for flowbetween links ( --flowbetween ) in a fourth color
+#         Add paired end support to ABySS-Explorer ouput, and use exclusively the
+#           new ABySS-Explorer 1.3.0 .dot format
+# 1.0.8 - August 3, 2013
+#         Error message if contig number does not exist in the assembly
+#         Add --nondirectdashed
+my $version            = "1.0.8";
+
+
+
+############################################################
+# configuration variables
+############################################################
+my $bpabbreviation       = "nt";    # set to b.p., bp, nt, or even a null string, as you prefer
+my $defaultmaxlevel      = 2;
+my $debuglimit           = 1000;    # how long print debug messages while extending
+my $numdigits            = 5;       # contig numbers filled out with leading zeroes to this length
+my $scalefactor          = 0.01;    # convert b.p. to graphviz length by multiplying by this value
+my $defaultoverlapmode   = "false"; # neato overlap mode in graph section, "true" to disable
+my $defaultouttype       = "png";   # default image type ( passed to neato )
+my $dotheaderid          = "adj";   # ABySS-Explorer .dot file header id
+my $contiggraphtxt       = "454ContigGraph.txt";  # this is defined by gsAssembler/Newbler
+my $allcontigsfna        = "454AllContigs.fna";   # this is defined by gsAssembler/Newbler
+my $defaultminflowbetween = 1;
+
+# default color definitions
+my $deadendcolor         = "tomato";
+my $recursionlimitcolor  = "gold";
+my $normallinkcolor      = "";            # leave blank for the default color of black
+my $normalfontcolor      = $normallinkcolor;
+my $forcedlinkcolor      = "red";         # links from --force parameter
+my $forcedfontcolor      = $forcedlinkcolor;
+my $pairedendlinkcolor   = "dodgerblue";  # links from paired end information
+my $pairedendfontcolor   = $pairedendlinkcolor;
+my $flowbetweenlinkcolor = "purple";      # links from flowthrough "F" information
+my $flowbetweenfontcolor = $flowbetweenlinkcolor;
+my $flowthroughlinkcolor = "forestgreen"; # links from flowthrough "I" information
+my $flowthroughfontcolor = $flowthroughlinkcolor;
+my $abyssk = 1;       # we don't use kmers, so set this to 1 so coverage will be direct conversion
+my $abyssedge = 0;    # negative kmer minus 1, thus zero
+my $abyssevalue = 0;  # we don't have a value for this, so just use zero always
+
+
+
+############################################################
+# global variables
+############################################################
+my $ansiup      = "\033[1A";  # terminal control
+(my $prognopath = $0) =~ s/^.*[\/\\]//;
+my @contiglen   = ();   # contig length
+my @contigcov   = ();   # contig average coverage
+my %ends        = ();   # key is contig . "3'" or "5'" or "0'", with optional "p", "f", or "i",
+                        # values are @[ contig, 3'|5', #reads, flag ]
+my %pairs		= ();	#used for temporary storage of paired end information until link ends can be sorted.. [Simon Gladman - 2011]
+my %deadends    = ();   # key is contig, value is # of ends with reads extending ( so 1 = dead end )
+my %minrl       = ();   # key is contig, value is lowest recursion level seen for this contig
+my %seen        = ();   # key is contig, value is >=1 if we already traversed, undefined if not
+                        #   actual value reflects recursion level when seen
+my %edgeseen    = ();   # key is contig 3'or5' contig 3'or5', value = 1 or undefined
+my %taghash     = ();   # key is contig, value is array of tags
+my %colorhash   = ();   # key is contig, value is array of colors
+my %excludehash = ();   # key is contig, value is 1 to exclude
+my %inverthash  = ();   # key is contig, value is 1 to exclude
+my %data        = ();   # subset of %ends that will end up in graph
+my %flowdata    = ();   # store flow through read data here
+my $extensions  = 0;    # number of auto-extensions so far (for --extend)
+my @extarr      = ();   # extensions will apply only to supplied contigs, not auto-added ones
+my $infilename  = "";   # 454ContigGraph.txt path and name
+my @listofexcl  = ();   # list of excluded contigs, --listexcluded turns this on
+my $deletecmdfile = 1;  # becomes 0 if a command file name is explicitly specified
+my $returncode  = 0;    # return code of this program
+
+
+
+############################################################
+# command line parameters
+############################################################
+my $indirname   = "";   # input file name
+my $outfilename = "";   # output file name
+my $outtype     = $defaultouttype;  # output image file format
+my $cmdfilename = "";   # graphviz .dot language command file name
+my $imgfilename = "";   # image file name
+my $outfastaname = "";  # create FASTA file of contigs in output
+my $level       = $defaultmaxlevel;    # maximum number of levels of recursion
+my $boldabove   = 0;
+my @contig      = ();   # starting contig(s)
+my @tag         = ();   # tag certain contigs
+my @color       = ();   # color certain contigs
+my @exclude     = ();   # never go into these contigs (e.g. repeat regions)
+my @invert      = ();   # contigs to plot backwards
+my $len         = 1;    # neato len parameter
+my $listexcluded = 0;   # list contigs that have been excluded
+my $extend      = 0;    # auto extend for best contig
+my @forcelink   = ();   # force links where none may exist
+my $showbp      = 0;    # include length in b.p. in graph
+my $showcov     = 0;    # include contig average coverage in graph
+my $lowlimit    = 0;    # ignore links with read limit < this
+my $highlimit   = 0;    # ignore links with read number > this
+my $nolabel     = 0;    # disable dead end and recursion limit labelling
+my $overlapmode = $defaultoverlapmode;
+my $nospline    = 0;    # to disable splines
+my $scaffold    = 0;    # to enable scaffold connection information
+my $pairlinks   = 0;    # to enable paired end read connection information
+my $flowthrough = 0;    # to enable flowthrough connection information
+my $flowbetween;        # to enable flow between connection information, has optional value also
+my $alllinks    = 0;    # sets --pairlinks --flowthrough --flowbetween and --scaffold
+my $nondirectdashed = ""; # all links except direct are dashed lines
+my $abyssdotfile;       # generate file for use with ABySS-Explorer
+my $help        = 0;    # print help and exit
+my $quiet       = 0;    # only show errors
+my $debug       = 0;    # print extra debugging information
+GetOptions (
+            "indir=s"        => \$indirname,         # string
+            "outfile=s"      => \$outfilename,       # string
+            "type=s"         => \$outtype,           # string
+            "cmdfile=s"      => \$cmdfilename,       # string
+            "imgfile=s"      => \$imgfilename,       # string
+            "fastaout=s"     => \$outfastaname,      # string
+            "abyssexplorer=s"=> \$abyssdotfile,      # string
+            "level=i"        => \$level,             # integer
+            "boldabove=i"    => \$boldabove,         # integer
+            "contig=s"       => \@contig,            # string array
+            "exclude=s"      => \@exclude,           # string array
+            "invert=s"       => \@invert,            # string array
+            "tag|label=s"    => \@tag,               # string array
+            "color=s"        => \@color,             # string array
+            "forcelink=s"    => \@forcelink,         # string array
+            "len=s"          => \$len,               # real
+            "extend=i"       => \$extend,            # integer
+            "lowlimit=i"     => \$lowlimit,          # integer
+            "highlimit=i"    => \$highlimit,         # integer
+            "nolabel"        => \$nolabel,           # flag
+            "nospline"       => \$nospline,          # flag
+            "pairlinks"      => \$pairlinks,         # flag
+            "scaffold"       => \$scaffold,          # flag
+            "flowthrough"    => \$flowthrough,       # flag
+            "flowbetween:s"  => \$flowbetween,       # flag/string
+            "alllinks"       => \$alllinks,          # flag
+            "overlapmode=s"  => \$overlapmode,       # string
+            "listexcluded"   => \$listexcluded,      # flag
+            "showbp|shownt"  => \$showbp,            # flag
+            "showcoverage"   => \$showcov,           # flag
+            "nondirectdashed"=> \$nondirectdashed,   # flag
+            "help"           => \$help,              # flag
+            "quiet"          => \$quiet,             # flag
+            "debug"          => \$debug);            # flag
+# debug implies not quiet
+if ( $debug ) { $quiet = 0; }
+unless ( ( $indirname ) and ( $outfilename ) and ( scalar @contig ) ) { $help = 1; }
+
+# changing meaning of --scaffold for future use
+if ( $scaffold )
+  { die "--scaffold has been changed to --pairlinks\n"; }
+
+# $flowbetween is a flag with an optional value, set default value if no value was specified
+if ( ( defined $flowbetween ) and ( $flowbetween eq "" ) ) { $flowbetween = $defaultminflowbetween; }
+
+if ( $alllinks )
+  {
+    $pairlinks = 1;
+    $flowthrough = 1;
+    $flowbetween = $defaultminflowbetween;
+    $scaffold = 1;  # future use
+  }
+
+if ( $nondirectdashed ) { $nondirectdashed = " style=dashed"; } else { $nondirectdashed = ""; }
+# allow specification of only the directory
+unless ( ( -d $indirname ) or ( $help ) )
+  { 
+    print "Error, specified input directory \"$indirname\" does not exist or is not a directory\n";
+    $help = 1;
+  }
+$infilename = $indirname;
+unless ( $infilename =~ m/\/$/ ) { $infilename .= "/"; }
+$infilename .= $contiggraphtxt;
+
+# make sure input file exists
+unless ( ( -e $infilename ) or ( $help ) )
+  {
+    print "Error, input file \"$infilename\" does not exist\n";
+    $help = 1;
+  }
+
+# if no --imgfile, create name based on --outfile
+unless ( $imgfilename ) { $imgfilename = $outfilename . "." . $outtype; }
+# if no --cmdfile, create name based on --outfile
+if ( $cmdfilename )
+  { $deletecmdfile = 0; }
+else
+  { $cmdfilename = $outfilename . ".graphviz"; }
+if ( $outfilename =~ m/png$/i ) { warn "You probably do not want to append a .png extension on --outfile\n"; }
+
+# OBSOLETE
+# ABySS-Explorer idiosyncracy
+#if ( ( $abyssexplorer ) and ( $abyssexplorer !~ m/-4.adj/ ) )
+#  { print "WARNING: ABySS-Explorer versions <= 1.0.1 require that the input file name ends in \"-4.adj\"\n"; }
+
+
+
+############################################################
+# print help screen
+############################################################
+if ( $help )
+  {
+    print "$prognopath  version $version
+Required parameters:
+  --indir=xxx       path to 454 assembly directory
+  --outfile=xxx     output text file of results
+  --contig=xxx[,xxx]...
+                    one or more starting contig numbers,
+                    separated by comma, or multiple --contig
+                    parameters may be used. Use just the
+                    numeric portion of the contig
+Optional parameters:
+  --type=xxx        output file format, default is \"$defaultouttype\"
+                    ( anything besides \"png\" is experimental )
+  --cmdfile=xxx     graphviz command file in .dot language will be created
+                    using this name. If not specified, a temporary command
+                    file will be created, and it will be deleted when done
+  --imgfile=xxx     graph image file will be created with
+                    this name. If not specified, will be
+                    --outfile with .${outtype} extension added
+  --fastaout=xxx    create a FASTA file of all contigs in
+                    the output, save in this file
+  --abyssexplorer=xxx  Generate a .dot file that can be used for
+                    visualization with ABySS-Explorer 1.3.0,
+                    http://www.bcgsc.ca/platform/bioinfo/software/abyss-explorer";
+#                    for compatibility, the file name must end in \"-4.adj\"
+#                    If paired end information is available, and the
+#                    --pairlinks parameter is used, corresponding
+#                    \"-3.dist\" and \"-contigs.fa\" files will also be created
+print "
+  --flowthrough     include connection information derived from
+                    reads that flow through more than two contigs
+  --flowbetween[=x] include connection information derived from
+                    reads that flow from one contig into another
+                    by default, if the distance value is zero, it will not be
+                    shown, the optional value for this parameter is a minimum
+                    distance, defaulting to $defaultminflowbetween, set to --flowbetween=0 to show
+                    these links also
+  --pairlinks       include connection information derived
+                    from paired end reads, only applicable for assemblies
+                    containing paired end reads
+  --alllinks        sets --flowthrough, --flowbetween, and --pairlinks
+  --nondirectdashed all links except direct links are dashed lines
+  --tag=tagname,contig[,contig]...  
+                    list of 1 or more contigs will be given
+                    this tag. Multiple --tag allowed.
+                    tagname is a text label that will be shown
+                    in the final image, e.g. --tag=\"ATP1,14,34\"
+  --label           a synonym for --tag
+  --showbp          show length in b.p. in graph
+  --shownt          a synonym for --showbp
+  --showcoverage    show average contig read coverage in graph
+  --color=colorname,contig[,contig]...  
+                    like --tag, but color the contig.
+                    for list of valid color names see
+                    http://www.graphviz.org/doc/info/colors.html
+  --forcelink=xxx-5:yyy-3   force a link where none exists
+                    between specified ends, xxx and yyy are
+                    contig numbers
+  --level=xxx       maximum recursion level, default=$level
+  --boldabove=xxx   lines with read coverage >= this value
+                    will be drawn in bold. no default value
+  --exclude=xxx[,xxx]...
+                    one or contigs to never traverse past,
+                    for example a repeated region contig
+  --listexcluded    print out a list of which excluded contigs
+                    are being ignored
+  --invert=xxx[,xxx]...
+                    one or more contigs to plot backwards on
+                    the graph, i.e. 3' to 5' direction
+  --extend=xxx      auto extension for the single best
+                    path, value is maximum steps, default=$extend
+  --lowlimit=xxx    ignore connections < this number of reads
+  --highlimit=xxx   ignore connections > this number of reads
+  --len=xxx         len parameter to neato, default=$len
+  --nolabel         disable highlighting of dead ends, and limit
+                    of recursion contigs
+  --overlapmode     neato paramter, default is $overlapmode, one of
+                    none, true, scale
+  --nospline        disable spline when edges would overlap
+  --help            print this screen
+  --quiet           only print error messages
+  --debug           print extra debugging information
+
+In place of lists of contigs, you can use \@filename to read in
+values for that parameter from a file, e.g. --exclude=\@excl.txt
+
+This program requires that the graphviz program \"neato\" be
+available in the default PATH. The graphviz web site is
+http://www.graphviz.org/
+";
+    exit 1;
+  } # if ( $help )
+
+
+
+############################################################
+# expand --contig lists separated by commas into single array
+############################################################
+{
+my @tmp = ();
+foreach my $acontig (@contig)
+  {
+    $acontig = expandatprefix ( $acontig );
+    push ( @tmp, split ( /\s*[,;]\s*/, $acontig ) );
+  }
+# cleaning and validation
+@contig = ();
+foreach my $item ( @tmp )
+  {
+    $item = expandatprefix ( $item );
+    $item =~ s/^0+//;   # remove leading zeroes
+    $item =~ s/\s//g;   # remove any white space
+    $item =~ s/[\+\-]//g;  # allow "+" or "-" in contig numbers, but it is ignored
+    if ( $item =~ m/[^\d]/ ) { die "Error, non-numeric character used for --contig \"$item\"\n"; }
+    unless ( $item =~ m/^$/ )  # skip null items
+      { push ( @contig, $item ); }
+  }
+debugmsg ( "Supplied contig list of ".scalar(@contig)." contigs = \"".join ("\" \"", @contig)."\"" );
+}
+
+
+
+############################################################
+# expand --tag lists separated by commas into hash of arrays
+############################################################
+{
+my $ntags = 0;
+foreach my $atag (@tag)
+  {
+    my @tmp = split ( /\s*[,;]\s*/, $atag );
+    my $taglabel = shift ( @tmp );
+    foreach my $item ( @tmp )
+      {
+        $item = expandatprefix ( $item );
+        $item =~ s/^0+//;  # remove leading zeroes
+        unless ( $item =~ m/^$/ ) # skip null items
+          {
+            push ( @{$taghash{$item}}, $taglabel );
+            $ntags++;
+          }
+      }
+  } # foreach (@tag)
+debugmsg ( "Stored ".commify($ntags)." tags" );
+}
+
+
+
+############################################################
+# expand --color lists separated by commas into hash of arrays
+############################################################
+{
+my $ncolors = 0;
+foreach my $acolor (@color)
+  {
+    my @tmp = split ( /\s*[,;]\s*/, $acolor );
+    my $colorlabel = shift ( @tmp );
+    foreach my $item ( @tmp )
+      {
+        $item = expandatprefix ( $item );
+        $item =~ s/^0+//;  # remove leading zeroes
+        $item =~ s/[\-\+]//g;  # remove plus or minus - has no meaning, but this is a convenience to be compatible with bb.fastareorder
+        unless ( $item =~ m/^$/ ) # skip null items
+          {
+            push ( @{$colorhash{$item}}, $colorlabel );
+            $ncolors++;
+          }
+      }
+  } # foreach (@color)
+debugmsg ( "Stored ".commify($ncolors)." colors" );
+}
+
+
+
+############################################################
+# expand --forcelink lists separated by commas into hash of arrays
+############################################################
+{
+my $nforce = 0;
+foreach my $aforce (@forcelink)
+  {
+    my @tmp = split ( /\s*[,;]\s*/, $aforce );
+    foreach my $link ( @tmp )
+      {
+        $link = expandatprefix ( $link );
+        my @parts = split ( /\s*[:-]\s*/, $link );
+        unless ( scalar @parts == 4 ) { die "Invalid format for --forcelink \"$link\"\n"; }
+        foreach ( @parts )
+          {
+            s/^0+//;   # remove leading zeroes
+            s/'//g;    # remove primes (they are optional)
+          }
+        # add this artificial link to the list
+
+        push ( @{$ends{$parts[0].$parts[1]."'"}}, [ $parts[2], $parts[3]."'", 0 ] );
+        push ( @{$ends{$parts[2].$parts[3]."'"}}, [ $parts[0], $parts[1]."'", 0 ] );
+
+      }
+    $nforce++;
+  } # foreach (@forcelink)
+debugmsg ( "Stored ".commify($nforce)." forced links" );
+}
+
+
+
+############################################################
+# convert --exclude lists to a simple hash
+############################################################
+{
+foreach my $aexclude (@exclude)
+  { 
+    foreach my $item ( split ( /\s*[,;]\s*/, $aexclude ) )
+      {
+        $item = expandatprefix ( $item );
+        # cleaning and validation
+        $item =~ s/^0+//;   # remove leading zeroes
+        $item =~ s/\s//g;   # remove any white space
+        unless ( $item =~ m/^$/ ) # skip null items
+          {
+            if ( $item =~ m/[^\d]/ ) { die "Error, non-numeric character used for --exclude \"$item\"\n"; }
+            $excludehash{$item} = 1;
+          }
+      }
+  }
+debugmsg ( "Stored ".commify(scalar keys %excludehash)." exclude contigs" );
+}
+
+
+
+############################################################
+# convert --invert lists to a simple hash
+############################################################
+{
+foreach my $ainvert (@invert)
+  { 
+    $ainvert = expandatprefix ( $ainvert );
+    foreach my $item ( split ( /\s*[,;]\s*/, $ainvert ) )
+      {
+        $item = expandatprefix ( $item );
+        # cleaning and validation
+        $item =~ s/^0+//;   # remove leading zeroes
+        $item =~ s/\s//g;   # remove any white space
+        unless ( $item =~ m/^$/ ) # skip null items
+          {
+            if ( $item =~ m/[^\d]/ ) { die "Error, non-numeric character used for --invert \"$item\"\n"; }
+            $inverthash{$item} = 1;
+          }
+      }
+  }
+debugmsg ( "Stored ".commify(scalar keys %inverthash)." invert contigs" );
+}
+
+
+
+############################################################
+# parse 454ContigGraph.txt
+############################################################
+# sample content: refer to this excellent description for more info:
+# http://contig.wordpress.com/2010/04/13/newbler-output-iii-the-454contiggraph-txt-file
+#1	contig00001	588	2.6
+#2	contig00002	1072	6.8
+#3	contig00003	644	4.1
+#...
+#C	7       3'      14770   5'      3
+#C	12      3'      14824   5'      5
+#C	12      3'      52148   5'      4
+#...
+#S       1       84148   1:+;2:+;gapOneNoEdges:186;3:+;4:+;5:+;6:+
+#S       2       17530   7:+
+#S       3       25222   8:+;9:-;10:-;11:+;12:+;14:+;gapMultiEdges:4733;15:+;gapMultiEdges:4241;16:+;17:+;19:+
+#...
+#I	7       aCAACaTTATCATTGtATTTatATTCcTGTTtGAGATACGTGTGGACAGAGAATGTTGGTTTTTTGGACTAGAATCGGATTTATCATTATTATAATGT...
+#I	48      AGTTCGTCCTGGACGACTTGAGTT        11:19543-5'..16159-5';6:19543-5'..60104-5'
+#I	50      GGgTAATAGTTGACCGTCTTACGAAATtGGCACATTTTCTTCCAATTAACGAGAAATCTTCggtAGACAGACTAGTTCATATGTATGTGCGtGAAATC...
+#...
+#F	7       -       14770/3/0.0
+#F	8       56895/6/0.0;54006/2/231.5       -
+#F	12      -       14824/5/0.0;52148/4/0.0
+#...
+#P       1       10130/2/0.0;33848/3/0.0;34537/2/397.0;25104/2/679.5;15/170/698.4;6/2/1600.0;209/175/2352.0;9364/2/3929.5;19/89/4351.2;16/128/5345.5;17/25/5380.7;14/15/603...
+#P       2       1/284/927.3;20341/2/7324.0;23108/2/8174.5       4/210/2787.7;3/22/3918.7;39/2/4345.5
+#P       3       4/183/1037.9;24637/4/6940.0     1/156/3004.0;2/22/3918.7;1675/2/4906.0;29922/3/5867.0;97/2/6139.5;7360/2/7464.0
+{
+my $lines = 0;
+my $clines = 0;
+my $ilines = 0;
+my $flines = 0;
+my $slines = 0;
+my $plines = 0;
+my $endsstored = 0;
+open ( my $INF, "<", $infilename ) or die ( "Error opening input file \"$infilename\": $!\n" );
+while ( my $aline = <$INF> )
+  {
+    $lines++;
+
+    # progress indicator
+    unless ( $quiet ) { if ( ( $lines % 1000 ) == 0 ) { print commify($lines), "\n", $ansiup; } }
+
+    $aline =~ s/[\r\n]//g;
+    my @cols = split ( /\t/, $aline );
+
+
+    if ( $cols[0] eq "C" )
+      {
+        $clines++;
+        # store both orientations in hash
+        my $keep = 1;
+        if ( $cols[5] < $lowlimit ) { $keep = 0; }
+        if ( ( $highlimit ) and ( $cols[5] > $highlimit ) ) { $keep = 0; }
+        if ( $keep )
+          {
+            # store data from each end, the three columns are [0]=nextcontig [1]=5'|3'|5'p|3'p|5'f|3'f|5'i... [2]=readnum
+            push ( @{$ends{$cols[1].$cols[2]}}, [ $cols[3], $cols[4], $cols[5] ] );
+            # and store reciprocal end
+            push ( @{$ends{$cols[3].$cols[4]}}, [ $cols[1], $cols[2], $cols[5] ] );
+            $endsstored+=2;
+          } # if $keep
+        if ( $endsstored < $debuglimit )
+          {
+            my $txt = $keep?"    Storing":"Not storing";
+            debugmsg ( "$txt ends: \$ends{$cols[1]$cols[2]}  [ $cols[3], $cols[4], $cols[5] ];" );
+            debugmsg ( "                : \$ends{$cols[3]$cols[4]}  [ $cols[1], $cols[2], $cols[5] ];" );
+          }
+      } # "C"
+
+
+    elsif ( $cols[0] eq "I" )  # flowthrough information
+      {
+        $ilines++;
+        if ( $flowthrough )
+          {
+            # cols[1] is contig number
+            # cols[2] is contig sequence ( if <= 256 b.p.)
+            # cols[3] is the through-flow information, a ";" delimited list of 
+            #   the format 15:1805-3'..207-3'
+            # cols[3] will sometimes be null
+            if ( $cols[3] )
+              {
+                my @parts = split ( /;/, $cols[3] );
+                foreach my $apart ( @parts )
+                  {
+                    my @subparts = split ( /[:\-\.]/, $apart );
+                    # @subparts columns become [0]=15 [1]=1805 [2]=3' [3]=null [4]=207 [5]=3'
+                    push ( @{$ends{$cols[1]."0'"."i"}}, [ $subparts[1], $subparts[2], $subparts[0] ] );
+                    push ( @{$ends{$cols[1]."0'"."i"}}, [ $subparts[3], $subparts[4], $subparts[0] ] );
+                  } # foreach @leftparts
+              } # if ( $cols[3] )
+          } # if ( $flowthrough )
+      } # "I"
+
+
+    elsif ( $cols[0] eq "F" )  # flowbetween information
+      {
+        $flines++;
+        if ( defined $flowbetween )
+          {
+            # cols[1] is contig number
+            # cols[2] is flow information for reads flowing from the 5' end of the contig
+            # cols[3] is flow information for reads flowing from the 3' end of the contig
+            my @leftparts = split ( /;/, $cols[2] );
+            my @rightparts = split ( /;/, $cols[3] );
+            # each part is of the format xx/yy/z.z where xx=contig yy=number of reads z.z=distance in b.p.
+            if ( $cols[2] ne "-" )  # "-" is the indicator for null entry
+              {
+                foreach my $apart ( @leftparts )
+                  {
+                    my @subparts = split ( /\//, $apart );
+                    # this, and paired links is the only case where we save a fourth column in
+                    # the %ends hash, a distance in b.p. value
+                    # $flowbetween is also used as a minimum distance cutoff for filtering, so
+                    # filter by this distance value, and ignore if too short
+                    if ( $subparts[2] >= $flowbetween )
+                      { push ( @{$ends{$cols[1]."5'f"}}, [ $subparts[0], "0'", $subparts[1], $subparts[2] ] ); }
+                  } # foreach @leftparts
+              } # if ne "-"
+            if ( $cols[3] ne "-" )  # "-" is the indicator for null entry
+              {
+                foreach my $apart ( @rightparts )
+                  {
+                    my @subparts = split ( /\//, $apart );
+                    if ( $subparts[2] >= $flowbetween )
+                      { push ( @{$ends{$cols[1]."3'f"}}, [ $subparts[0], "0'", $subparts[1], $subparts[2] ] ); }
+                  } # foreach @leftparts
+              } # if ne "-"
+          } # if ( defined $flowbetween )
+      } # "F"
+
+
+    elsif ( $cols[0] eq "S" )
+      {
+        $slines++;
+      } # "S"
+
+
+    elsif ( $cols[0] eq "P" )
+      {
+		$plines++;
+		if ( $pairlinks ) {
+			my $con_number = $cols[1];
+			my $fiveprime_connects = $cols[2];
+			my $threeprime_connects = $cols[3];
+			my @tmp = split ";", $fiveprime_connects;
+			foreach my $connection (@tmp){
+				#now split up the connection.
+				next if $connection eq "-";
+				my @x = split "/", $connection;
+				my $termcontig = $x[0];
+				my $num_connects = $x[1];
+				my $distance = $x[2];
+				if($num_connects >= $lowlimit){
+					#store in temp pairs var and search through later for termcontig details.
+					push( @{$pairs{$con_number}}, [ $termcontig, "5'", $num_connects, $distance ] );
+					$endsstored += 2;
+					if ( $endsstored < $debuglimit )
+						{
+							debugmsg ( "Storing ends: \$ends{".$con_number."3'p} [ $termcontig, 5', $num_connects];" );
+							debugmsg ( "                : \$ends{".$termcontig."5'p} [ $con_number, 3', $num_connects];" );
+	               		}
+				}
+			}
+			@tmp = split ";", $threeprime_connects;
+			foreach my $connection (@tmp){
+				#now split up the connection
+				next if $connection eq "-";
+				my @x = split "/", $connection;
+				my $termcontig = $x[0];
+				my $num_connects = $x[1];
+				my $distance = $x[2];
+				if($num_connects >= $lowlimit){
+					#store in temp pairs var and search through later for termcontig details.
+					push( @{$pairs{$con_number}}, [ $termcontig, "3'", $num_connects, $distance ] );
+					$endsstored += 2;
+					if ( $endsstored < $debuglimit )
+						{
+							debugmsg ( "Storing ends: \$ends{".$con_number."3'p} [ $termcontig, 5', $num_connects];" );
+							debugmsg ( "                : \$ends{".$termcontig."5'p} [ $con_number, 3', $num_connects];" );
+	       		        }
+				}
+			}
+		} # if ( $pairlinks )
+      } # "P"
+
+
+    elsif ( $cols[0] =~ m/^\d+$/ )  # first section of file
+      {
+        $contiglen[$cols[0]] = $cols[2];
+        $contigcov[$cols[0]] = $cols[3];
+      } # section 1
+
+
+    else
+      {
+        die ( "Error on line $lines of file \"$infilename\", unknown type of content:\n$aline\n" );
+      }
+
+  } # while <$INF>
+close $INF;
+
+
+debugmsg ( commify($lines) . " lines read from input file \"$infilename\"" );
+debugmsg ( commify($#contiglen) . " contig lengths were stored" );
+debugmsg ( commify($clines) . " \"C\" lines were found" );
+debugmsg ( commify($endsstored) . " ends were stored" );
+debugmsg ( commify($ilines) . " \"I\" lines were found" );
+debugmsg ( commify($flines) . " \"F\" lines were found" );
+debugmsg ( commify($plines) . " \"P\" lines were found" );
+debugmsg ( commify($slines) . " \"S\" lines were found (and ignored)" );
+}
+
+
+
+############################################################
+# make paired end information links
+############################################################
+# Added by Simon Gladman - CSIRO - 2011
+# Adds paired end links to the link data variable "%ends"
+foreach my $key (keys %pairs){
+	my @contig = @{$pairs{$key}};
+	foreach my $tmp (@contig){
+		my @x = @{$tmp};
+		my $term_contig = $x[0];
+
+		my @tcontig;  # 10/11/2011 is this a bug? occassional not defined state here
+		if ( $pairs{$term_contig} ) { @tcontig = @{$pairs{$term_contig}}; } # end of fix
+		#my @tcontig = @{$pairs{$term_contig}};
+
+		foreach my $ttmp (@tcontig){
+			my @y = @{$ttmp};
+			if($y[0] == $key){
+				
+				push( @{$ends{$key."$x[1]"."p"}}, [ $term_contig, "$y[1]", $x[2], $x[3] ] );
+				push( @{$ends{$term_contig."$y[1]"."p"}}, [ $key, "$x[1]", $y[2], $y[3] ] );
+				last;
+			}
+		}
+	}
+}
+
+
+
+############################################################
+# sort data
+############################################################
+# sort data so that higher read coverage links come first
+# sorting is only needed if we will automatically extend network
+if ( $extend )
+  {
+    # extend applies only to command line contigs and not auto-generated ones
+    foreach ( @contig )
+      { push ( @extarr, $extend ) }  # but the $extend value just evaluates to "true" later
+    debugmsg ( "--extend=$extend, Sorting data" );
+    foreach my $key ( keys %ends )
+      {
+        @{$ends{$key}} = sort {$b->[2] <=> $a->[2]} @{$ends{$key}};
+      } # foreach my $key ( keys %ends )
+    debugmsg ( "Extend contig list of ".scalar(@extarr)." contigs" );
+  } # if ( $extend )
+
+
+
+############################################################
+# dead end detection
+############################################################
+# dead ends are contigs which might have reads extending to another contig
+# from either the 5' or 3' end, but not both. Both ends could be dead ends, too.
+# %deadends{contigid} is # of ends extending, so 1 = dead end,
+# 2 = continues both ends, 0=isolated contig without any connections
+unless ( $nolabel )
+  {
+    debugmsg ( "Dead end detection" );
+    foreach my $key ( keys %ends )
+      {
+        ( my $contig = $key ) =~ s/[530]'[pfis]?$//;  # remove 5' or 3' or 5'p etc at end of string
+        # note that this version of $contig does not have leading zeroes
+        $deadends{$contig}++;
+        @{$ends{$key}} = sort {$b->[2] <=> $a->[2]} @{$ends{$key}};
+      } # foreach my $key ( keys %ends )
+  } # unless ( $nolabel )
+
+
+
+############################################################
+# construct network from starting point(s)
+############################################################
+my $totalnodes = 0;
+my $index = 0;
+foreach my $acontig (@contig)
+  {
+    my $dbgtxt = (defined $extarr[$index])?"user-defined":"auto-extend";
+
+    debugmsg ( "Contig #".($index+1)."=$dbgtxt, Recursion starting at \"$acontig\"" );
+    # when hit end of our specified contigs
+    unless ( defined $extarr[$index] )
+      {
+        if ( $extend ) { debugmsg ( "At end of specified contigs, turning off extend" ); }
+        $extend = 0;
+      }
+    recurse ( $acontig, "", "", 0, $extend );
+    $index++;
+  } # foreach my $acontig (@contig)
+unless ( $quiet ) { print commify($totalnodes), " nodes present in output\n"; }
+
+
+
+############################################################
+sub recurse { my ( $startcontig, $camefrom, $fromend, $recurselevel, $followlevel ) = @_;
+############################################################
+  unless ( $totalnodes > $debuglimit ) { debugmsg ( "recurse \"$startcontig\", camefrom=\"$camefrom\" end=\"$fromend\" recurselevel=$recurselevel" ); }
+
+  # data for this contig is in @ { %ends{contig . 5'|3'|5'p|3'p|5'f|3'f|5'i... } } [0]=nextcontig [1]=5'|3'|5'p|3'p"5'f|3'f|5'i... [2]=readnum
+
+  # store lowest recursion level seen for this contig
+  unless ( $nolabel )
+    {
+      if ( ( ! defined $minrl{$startcontig} ) or ( $recurselevel < $minrl{$startcontig} ) )
+        { $minrl{$startcontig} = $recurselevel; }
+    } # unless ( $nolabel )
+
+  # here is the limit to recursion
+  my $stophere = 0;
+  if ( $recurselevel > $level )
+    {
+      unless ( $totalnodes > $debuglimit ) { debugmsg ( "recursion for \"$startcontig\" at limit level=$level, returning" ); }
+      $stophere = 1;
+    }
+
+  # return if this contig is on the exclude list
+  elsif ( $excludehash{$startcontig} )
+    {
+      unless ( $totalnodes > $debuglimit ) { debugmsg ( "contig \"$startcontig\" on exclude list, returning" ); }
+      # save information for list of excluded option
+      my @row = ( $startcontig, $camefrom, $fromend );
+      push ( @listofexcl, \@row );
+      return 0;
+## was this wrong? always return if on exclude list     $stophere = 1;
+    }
+
+  # skip return if follow allows it
+  if ( ( $stophere ) and ( $followlevel < 1 ) ) { return 0; }
+
+  # count nodes
+  unless ( defined $seen{$startcontig} )
+    {
+      if ( $startcontig =~ m/^\s*$/ ) { die "Error, null contig in sub recurse($startcontig, $camefrom, $fromend, $recurselevel, $followlevel)\n"; }
+      $seen{$startcontig} = 1;
+      $totalnodes++;
+    }
+
+  foreach my $end ( "5'", "3'", "5'p", "3'p", "5'f", "3'f", "5'i", "3'i", "0'" )
+    {
+      my $first = 1;
+      foreach my $contigref ( @{$ends{$startcontig.$end}} )
+        {
+          unless ( $totalnodes > $debuglimit ) { debugmsg ( "from \"$startcontig\" end \"$end\" find linked contig ".join(";",@$contigref) ); }
+
+          # always skip links back to where we just came from ( and don't clear $first flag )
+          if ( $contigref->[0] eq $camefrom )
+            {
+              unless ( $totalnodes > $debuglimit ) { debugmsg ( "\"$startcontig\": skipping link back to source contig \"$camefrom\"" ); }
+              next;
+            }
+
+          # skip data storing if this edge was already stored
+          unless ( defined $edgeseen{$startcontig.$end.$contigref->[0].$contigref->[1]} )
+            {
+              debugmsg ( "Storing in \@data at key \"$startcontig$end\": [ \"".join ( "\", \"", @$contigref )."\" ]" );
+              push ( @{$data{$startcontig.$end}}, $contigref );  # $contigref is array reference
+
+              if ( ( $first ) and ( $followlevel ) )
+                {
+                  unless ( $totalnodes > $debuglimit ) { debugmsg ( "auto extension following contig \"$contigref->[0]\", \$extensions=$extensions" ); }
+                  $extensions++;
+                  $edgeseen{$startcontig.$end.$contigref->[0].$contigref->[1]} = $recurselevel;
+                  recurse ( $contigref->[0], $startcontig, $end, $recurselevel, $followlevel-1 );
+                } # if
+            } # unless $edgeseen
+          else
+            { debugmsg ( "Seen, not storing in \@data at key \"$startcontig$end\": [ \"".join ( "\", \"", @$contigref )."\" ]" ); }
+
+
+          # recurse if edge seen level is higher than current level or not seen before
+          if ( ( ! defined $edgeseen{$startcontig.$end.$contigref->[0].$contigref->[1]} ) or
+               ( $edgeseen{$startcontig.$end.$contigref->[0].$contigref->[1]} > $recurselevel ) )
+            {
+              $edgeseen{$startcontig.$end.$contigref->[0].$contigref->[1]} = $recurselevel;
+              recurse ( $contigref->[0], $startcontig, $end, $recurselevel+1, 0 );
+            }
+          $first = 0;
+        } # foreach $contigref
+    } # foreach $end
+
+} # sub recurse
+
+
+
+############################################################
+# consolidate pairs of flow between links
+############################################################
+collapseflowbetween();
+
+
+
+############################################################
+# create output table text file
+############################################################
+createoutputtable();
+
+
+
+############################################################
+# generate optional ABySS-Explorer .dot file
+############################################################
+if ( $abyssdotfile ) { createabyssfile(); }
+
+
+
+############################################################
+# generate optional FASTA file
+############################################################
+if ( $outfastaname ) { createfastafile(); }
+
+
+
+############################################################
+# create graphviz command file (.dot file)
+############################################################
+my $savednodes = 0;
+my $savededges = 0;
+debugmsg ( "Creating graphviz command file \"$cmdfilename\"" );
+open ( my $OUTF, ">", $cmdfilename ) or die ( "Error creating graphviz command file \"$cmdfilename\": $!\n" );
+print $OUTF "graph G\n";
+print $OUTF "  {\n";
+print $OUTF "    edge [len=$len];\n";
+my $splinemode = $nospline?"false":"true";
+print $OUTF "    graph [overlap=$overlapmode,splines=$splinemode];\n";
+print $OUTF "    node [shape=plaintext];\n";
+
+# table of nodes
+print $OUTF "\n    // Nodes\n";
+foreach my $seencontig ( keys %seen )
+  {
+    my $contigid = sprintf ("%0${numdigits}d", $seencontig);
+
+    # box is proportional to size, except if contig is small,
+    # the box is still as large as the labels it contains
+    unless ( $contiglen[$seencontig] )
+      { die "Error, no contig length for \"$seencontig\", maybe you specified a nonexistant contig\n"; }
+    my $scaledcontiglen = sprintf ( "%1d", $contiglen[$seencontig] * $scalefactor );
+
+    # define the box representing the contig, implemented as a table in HTML
+    print $OUTF "    c$contigid [label=< <TABLE BORDER=\"1\" CELLBORDER=\"0\" CELLSPACING=\"0\" CELLPADDING=\"0\"";
+    if ( $colorhash{$seencontig}->[0] ) { print $OUTF " BGCOLOR=\"$colorhash{$seencontig}->[0]\""; }
+
+    # top row is always present
+    print $OUTF "><TR>";
+    if ( $inverthash{$seencontig} )
+      { print $OUTF "<TD PORT=\"R\">3'</TD>"; }
+    else
+      { print $OUTF "<TD PORT=\"L\">5'</TD>"; }
+    print $OUTF "<TD PORT=\"C\" WIDTH=\"$scaledcontiglen\"";
+    print $OUTF ">c$contigid</TD>";
+    if ( $inverthash{$seencontig} )
+      { print $OUTF "<TD PORT=\"L\">5'</TD>"; }
+    else
+      { print $OUTF "<TD PORT=\"R\">3'</TD>"; }
+    print $OUTF "</TR>";
+
+    # optional table row for contig size
+    if ( $showbp )
+      { print $OUTF "<TR><TD COLSPAN=\"3\">",commify($contiglen[$contigid])," $bpabbreviation</TD></TR>"; }
+
+    # optional table row for coverage
+    if ( $showcov )
+      { print $OUTF "<TR><TD COLSPAN=\"3\">cov=",commify($contigcov[$contigid]),"</TD></TR>"; }
+
+    # one or more optional rows for labels specified on the command line
+    if ( $taghash{$seencontig}->[0] )
+      {
+        foreach my $tag ( @{$taghash{$seencontig}} )
+          { print $OUTF "<TR><TD COLSPAN=\"3\">$tag</TD></TR>"; }
+      }
+
+    # optional final rows for dead end contigs, or recursion limit contigs
+    unless ( $nolabel )
+      {
+        if ( ( ! defined $deadends{$seencontig} ) or ( $deadends{$seencontig} <= 1 ) )
+          { print $OUTF "<TR><TD COLSPAN=\"3\" BGCOLOR=\"$deadendcolor\">Dead End</TD></TR>"; }
+        if ( ( defined $minrl{$seencontig} ) and ( $minrl{$seencontig} >= $level ) )
+          { print $OUTF "<TR><TD COLSPAN=\"3\" BGCOLOR=\"$recursionlimitcolor\">Recursion limit</TD></TR>"; }
+      } # unless ( $nolabel )
+
+    # and the end of this huge mess of HTML
+    print $OUTF "</TABLE> >];\n";
+
+  } # foreach my $seencontig ( keys %seen )
+debugmsg ( "Saved ".commify($savednodes)." nodes" );
+
+# table of edges ( connections )
+print $OUTF "\n    // Adjacency Edges\n";
+my %alreadydrawn = ();
+foreach my $key ( keys %data )
+  {
+    $key =~ m/^(.*)([530]'[pfis]?)$/;
+    my $srcend = $2;
+    my $srccontig = sprintf ("%0${numdigits}d", $1);
+    my $srclr = "C";
+    if ( $srcend =~ m/5'/ ) { $srclr = "L"; }
+    if ( $srcend =~ m/3'/ ) { $srclr = "R"; }
+    unless ( $srclr ) { die "Error, no valid end at \"$key\"\n"; }
+    if ( $savededges < $debuglimit ) { debugmsg ( "Key=\"$key\" Contig=\"$srccontig\" End=\"$srcend\" Port=\"$srclr\"" ); }
+    foreach my $edgeref (@{$data{$key}})  # edgeref elements: [0]=contig(no leading 0) [1]=5'|3'|5'p|3'p|5'f|3'f|5'i... [2]=readnumber
+      {
+        # skip those final edges not leading to a node in the %seen list,
+        # or those we have deleted by marking with "X"
+        if ( ( $seen{$edgeref->[0]} ) and ( $edgeref->[1] ne "X" ) )
+          {
+            if ( $savededges < $debuglimit ) { debugmsg ( "Edge=[ \"$edgeref->[0]\" \"$edgeref->[1]\" \"$edgeref->[2]\" ]" ); }
+
+            my $contigid = sprintf ("%0${numdigits}d", $edgeref->[0]);  # format for graph has leading zeroes
+            my $lr = "C";
+            if ( $edgeref->[1] =~ m/5'/ ) { $lr = "L"; }
+            if ( $edgeref->[1] =~ m/3'/ ) { $lr = "R"; }
+            unless ( $lr ) { die "Error no valid end at \"$edgeref->[0]\"\n"; }
+
+            unless ( $alreadydrawn{$srccontig.$srclr."-".$contigid.$lr} )
+              {
+                my $linklabel = $edgeref->[2];
+                if ( $edgeref->[3] )
+                  {
+                    # if the distance is 10 b.p. or greater, remove the decimal places to eliminate clutter
+                    if ( $edgeref->[3] >= 10 ) { $edgeref->[3] =~ s/\..*$//; }
+                    $linklabel .= "/" . $edgeref->[3] . $bpabbreviation;
+                  }
+                print $OUTF "    \"c$srccontig\":$srclr -- \"c$contigid\":$lr [label=\"$linklabel\"";
+
+                # bold for high coverage links
+                if ( ( $boldabove ) and ( $edgeref->[2] >= $boldabove ) and ( ! $nondirectdashed ) ) { print $OUTF " style=bold"; }
+
+                # specify colors of lines and labels connecting contigs
+                if ( $edgeref->[2] == 0 )  # forced link
+                  { print $OUTF " color=$forcedlinkcolor fontcolor=$forcedfontcolor" . $nondirectdashed; }
+                elsif ( ( $srcend =~ m/p/ ) or ( $edgeref->[1] =~ m/p/ ) )  # paired end link
+                  { print $OUTF " color=$pairedendlinkcolor fontcolor=$pairedendfontcolor" . $nondirectdashed; }
+                elsif ( ( $srcend =~ m/f/ ) or ( $edgeref->[1] =~ m/f/ ) )  # flowbetween link
+                  { print $OUTF " color=$flowbetweenlinkcolor fontcolor=$flowbetweenfontcolor" . $nondirectdashed; }
+                elsif ( ( $srcend =~ m/i/ ) or ( $edgeref->[1] =~ m/i/ ) )  # flowthrough link
+                  { print $OUTF " color=$flowthroughlinkcolor fontcolor=$flowthroughfontcolor" . $nondirectdashed; }
+                else  # if $normallinkcolor is a null string, don't specify any color, use default of black
+                  {
+                    if ( $normallinkcolor ) { print $OUTF " color=$normallinkcolor"; }
+                    if ( $normalfontcolor ) { print $OUTF " fontcolor=$normalfontcolor"; }
+                  }
+
+                print $OUTF "];\n";
+                $alreadydrawn{$contigid.$lr."-".$srccontig.$srclr} = 1;  # note we store in reverse orientation here
+                $savededges++;
+              }
+          }
+      } # foreach my $edgeref (@$arrayref)
+  } # foreach my $arrayref ( keys %data )
+debugmsg ( "Saved ".commify($savededges)." edges" );
+print $OUTF "  }\n";
+close $OUTF;
+
+
+
+############################################################
+# run graphviz program neato
+############################################################
+my $cmd = "neato -T${outtype} -o\"$imgfilename\" \"$cmdfilename\"";
+debugmsg ( "running command \"$cmd\"" );
+my $result = system ( $cmd );
+if ( $result )
+  {
+    print "Problem creating image. Error code $result returned from command \"$cmd\"\n";
+    $returncode = $result;
+  }
+else
+  {
+    unless ( $quiet )
+      { print "Success\n"; }
+  }
+
+# remove graphviz command file
+if ( $deletecmdfile ) { unlink $cmdfilename; }
+
+
+
+############################################################
+# print out list of excluded contigs
+############################################################
+if ( $listexcluded )
+  {
+    print "List of excluded contigs\n";
+    print "Contig\tLinked from\tFrom End\n";
+    foreach my $rowref ( @listofexcl )
+      { print join ( "\t", @{$rowref} ), "\n"; }
+  } # if ( $listexcluded )
+
+
+
+############################################################
+# end of program
+############################################################
+exit $returncode;
+
+
+
+############################################################
+sub collapseflowbetween {
+############################################################
+# flowbetween links do not have a ending end, so are designated 0' there,
+# but since they come in pairs, we can figure out the ends that way
+# and consolidate the two links into one to eliminate clutter
+# global variables (command line parameters) used:
+#   
+# other global variables uses
+#   %data
+
+my %finder;
+
+# first step is to create an index
+foreach my $key ( keys %data )
+  {
+    next unless ( $key =~ m/f/ );
+    unless ( $key =~ m/^(.*)([530]'[pfis]?)$/ ) { die "Program bug parsing key \"$key\"\n"; }
+    my $srcend = $2;
+    my $srccontig = $1; #sprintf ("%0${numdigits}d", $1);
+    foreach my $edgeref (@{$data{$key}})  # [0]contig(no leading 0) [1]5'|3'|5'p|3'p|5'f|3'f|5'i... [2]readnumber [3]distance
+      {
+        if ( $edgeref->[1] =~ m/0'/ )
+          {
+            my $bothkey = $srccontig . ":" . $edgeref->[0] . ":" . $edgeref->[3]; # omit source end in this key
+            debugmsg ( "Save collapsible reference \"$bothkey\" from key \"$key\"" );
+            # save the source end as array element [4]
+            $edgeref->[4] = $srcend;
+            push ( @{$finder{$bothkey}}, $edgeref );
+          }
+      } # foreach $edgeref
+  } # foreach my $key ( keys %data )
+
+# second step is to check the index for unique reciprocal links
+foreach my $key ( keys %data )
+  {
+    next unless ( $key =~ m/f/ );
+    unless ( $key =~ m/^(.*)([530]'[pfis]?)$/ ) { die "Program bug parsing key \"$key\"\n"; }
+    my $srcend = $2;
+    my $srccontig = $1;
+    foreach my $edgeref (@{$data{$key}})  # [0]contig(no leading 0) [1]5'|3'|5'p|3'p|5'f|3'f|5'i... [2]readnumber [3]distance
+      {
+        my $bothkey = $srccontig . ":" . $edgeref->[0] . ":" . $edgeref->[3];
+        my $reversekey = $edgeref->[0] . ":" . $srccontig . ":" . $edgeref->[3];
+
+        if ( ( $finder{$bothkey} ) and ( $finder{$reversekey} ) )
+          {
+            # if by chance multiple matches, do not merge links
+            if ( ( scalar @{$finder{$bothkey}} == 1 ) and ( scalar @{$finder{$reversekey}} == 1 ) )
+              {
+                debugmsg ( "Collapsing link \"$bothkey\" <=> \"$reversekey\"" );
+                my @parts = split ( /:/, $bothkey );
+                # look up the correct other end of this link from the other member of the reciprocal pair
+                my $correctotherend = $finder{$reversekey}->[0]->[4];
+                # save new link
+                push @{$data{$key}}, [ $edgeref->[0], $correctotherend, $edgeref->[2], $edgeref->[3] ];
+                # set flag on old links to indicate that they should be ignored later
+                # the value from %finder is a reference back to the $edgeref from %data,
+                # so here we are modifying the %data hash indirectly
+                $finder{$bothkey}->[0]->[1] = "X";
+                $finder{$reversekey}->[0]->[1] = "X";
+
+                # finished processing, remove both original links from %finder hash
+                # to avoid hitting the same link again in the reverse orientation
+                undef ( $finder{$bothkey} );
+                undef ( $finder{$reversekey} );
+              }
+            else
+              { debugmsg ( "Ignoring multiple collapsible links for \"$bothkey\" or \"$reversekey\"" ); }
+          }
+      } # foreach $edgeref
+  } # foreach my $key ( keys %data )
+} # sub collapseflowbetween
+
+
+
+############################################################
+sub createoutputtable {
+############################################################
+# global variables (command line parameters) used:
+#   $outfilename, $pairlinks, $flowthrough, $flowbetween, $scaffold
+# other global variables uses
+#   %data
+my %alreadyprinted = ();
+my $printededges = 0;
+open ( my $OUTF, ">", $outfilename ) or die ( "Error opening output file \"$outfilename\": $!\n" );
+print $OUTF join ( "\t", "#contig", "contiglen", "avg.cov.", "5'or3'", "is linked to", "5'or3'", "by read num", "contiglen", "avg.cov." );
+if ( ( $pairlinks ) or ( $flowthrough ) or ( defined $flowbetween ) or ( $scaffold ) )
+  { print $OUTF "\tlink type"; }
+print $OUTF "\n";
+foreach my $key ( sort { ($a=~m/^(\d+)[530]'/)[0] <=> ($b=~m/^(\d+)[530]'/)[0] } keys %data )
+  {
+    unless ( $key =~ m/^(.*)([530]'[pfis]?)$/ ) { die "Program bug, unparsable key \"$key\"\n"; }
+    my $srccontig = $1;
+    my $srcend = $2;
+    foreach my $edgeref (@{$data{$key}})  # [0]contig(no leading 0) [1]5'|3'|5'p|3'p|5'f|3'f|5'i... [2]readnumber
+      {
+        unless ( ( $alreadyprinted{$srccontig.$srcend."-".$edgeref->[0].$edgeref->[1]} ) or ( $edgeref->[1] eq "X" ) )
+          {
+            print $OUTF join ( "\t", $srccontig, $contiglen[$srccontig], $contigcov[$srccontig],
+                                     $srcend, $edgeref->[0], $edgeref->[1], $edgeref->[2],
+                                     $contiglen[$edgeref->[0]], $contigcov[$edgeref->[0]] );
+            if ( ( $pairlinks ) or ( $flowthrough ) or ( defined $flowbetween ) or ( $scaffold ) )
+              {
+                my $t = "direct";
+                if ( $srcend =~ m/p/ ) { $t = "paired-end"; }
+                if ( $srcend =~ m/f/ ) { $t = "flowbetween"; }
+                if ( $srcend =~ m/i/ ) { $t = "flowthrough"; }
+                if ( $srcend =~ m/s/ ) { $t = "scaffold"; }
+                print $OUTF "\t", $t;
+              }
+            print $OUTF "\n";
+            $alreadyprinted{$edgeref->[0].$edgeref->[1]."-".$srccontig.$srcend} = 1;  # note we store in reverse orientation here
+            $printededges++;
+          }
+      } # foreach my $edgeref (@{$data{$key}})
+  } # foreach my $arrayref ( keys %data )
+debugmsg ( "Printed ".commify($printededges)." edges to output file \"$outfilename\"" );
+close $OUTF;
+} # sub createoutputtable
+
+
+
+############################################################
+sub createabyssfile {
+############################################################
+    # global variables (command line parameters) used:
+    #   $abyssdotfile, $pairlinks, $flowthrough, $flowbetween, $scaffold
+    # other global variables uses
+    #   %data
+
+    # collect connection data
+    my %aedata;   # direct links
+    my %aepdata;  # paired end links
+    foreach my $key ( keys %data )
+      {
+        unless ( $key =~ m/^(.*)([530]'[pfis]?)$/ ) { die "Program bug parsing key \"$key\"\n"; }
+        my $srccontig = $1;
+        my $srcend = $2;
+        debugmsg ( "AE: key=\"$key\" becomes srccontig=\"$srccontig\" srcend=\"$srcend\"" );
+        foreach my $edgeref (@{$data{$key}})  # edgeref elements: [0]=contig(no leading 0) [1]=5'|3'|5'p|3'p|5'i... [2]=readnumber [3]=distance
+          {
+            if ( $edgeref->[1] eq "X" )  # masked entry, ignore it
+              {
+                debugmsg ( "AE: masked edgeref \"$edgeref->[0]\" \"$edgeref->[1]\" \"$edgeref->[2]\"" );
+                next;
+              }
+            if ( $key !~ m/[pfis]/ )  # direct connection
+              {
+                my $nreads = $edgeref->[2];
+                my $distance = 0;
+                debugmsg ( "AE: direct edgeref \"$edgeref->[0]\" \"$edgeref->[1]\" \"$edgeref->[2]\"" );
+                # values assigned here are not currently used, just the state of being defined
+                $aedata{$srccontig}->{$srcend}->{$edgeref->[0]}->{$edgeref->[1]} = [ $distance, $nreads ];  # $nreads would be zero for forced links
+                # if no links otherwise show up, still need a dummy line in the .adj file
+                $aedata{$edgeref->[0]}->{used} = 1;
+              }
+            elsif ( $key =~ m/p/ )  # paired end connection
+              {
+                my $nreads = $edgeref->[2];
+                my $distance = $edgeref->[3];
+                debugmsg ( "AE: paired-end edgeref \"$edgeref->[0]\" \"$edgeref->[1]\" \"$edgeref->[2]\" \"$edgeref->[3]\"" );
+                unless ( $distance ) { die "Program bug distance = \"$distance\" key $key\n"; }
+                $aepdata{$srccontig}->{$srcend}->{$edgeref->[0]}->{$edgeref->[1]} = [ $distance, $nreads ];
+                $aepdata{$edgeref->[0]}->{used} = 1;
+              }
+          } # foreach my $edgeref (@{$data{$key}})
+      } # foreach my $arrayref ( keys %data )
+
+    ##### ABySS-Explorer 1.3.0 .dot output file example lines
+    # parts of the example file SRP000220-6.dot
+    #digraph adj {
+    #graph [k=32]
+    #edge [d=-31]
+    #"18+" [l=334 C=32002]
+    #"18-" [l=334 C=32002]
+    #...
+    #"1807+" -> "1811-" [d=-706]
+    #"1807+" -> "1825+" [d=-706]
+    #
+    # from SRP000220-6.path1.dot
+    # "1861+" -> "1863+" [d=35 e=1.6 n=172]
+    # "1861+" -> "1886-" [d=-13 e=1.8 n=135]
+
+    # not sure about use of this file, not loadable SRX000430-6.dist.dot
+    #digraph dist {
+    #graph [k=32 s=100 n=10]
+    #"18+" -> "71-" [d=320 e=2.6 n=62]
+
+    debugmsg ( "Creating ABySS-Explorer .dot file \"$abyssdotfile\"" );
+    open ( my $OUTF, ">", $abyssdotfile ) or die ( "Error creating ABySS-Explorer .dot file \"$abyssdotfile\": $!\n" );
+    # start of .dot file, the header line, I don't know if other names than "adj" are valid, I didn't check
+    print $OUTF "digraph $dotheaderid \{\n";
+    print $OUTF "graph [k=", $abyssk, "]\n";   # this will be 1 because we don't use kmers
+    print $OUTF "edge [d=", $abyssedge, "]\n";
+
+    ### Vertices
+    {
+
+    my %list;  # make a list of just the contig numbers, but from both shotgun and paired end
+    foreach my $acontig ( keys %aedata )
+      {
+        if ( $aedata{$acontig}->{used} )
+        #$acontig =~ s/[530]'[pfis]?//;
+          { $list{$acontig} = 1; }
+      }
+    foreach my $acontig ( keys %aepdata )
+      {
+        if ( $aepdata{$acontig}->{used} )
+          { $list{$acontig} = 1; }
+      }
+
+    foreach my $acontig ( sort { $a <=> $b } keys %list )
+      {
+        # coverage must be an integer for ABySS-Explorer, so round to nearest integer
+        # multiply coverage by length because ABySS-Explorer uses kmer coverage, we need to simulate that
+        my $avgcov = sprintf( "%0d", ( $contigcov[$acontig] * $contiglen[$acontig] ) );
+        # print contig here
+        print $OUTF "\"" . $acontig . "+\" [l=" . $contiglen[$acontig] . " C=" . $avgcov . "]\n";
+        print $OUTF "\"" . $acontig . "-\" [l=" . $contiglen[$acontig] . " C=" . $avgcov . "]\n";
+      } # foreach my $acontig %data
+    }
+
+    ### adj pattern
+    foreach my $acontig ( sort { $a <=> $b } keys %aedata )  # $acontig is just a contig number
+      {
+        debugmsg ( "AE: write adj data for contig \"$acontig\"" );
+        foreach my $fend ( sort keys %{$aedata{$acontig}} )
+          {
+            next if ( $fend !~ m/\d/ ); # i.e., ne 'used'
+            foreach my $rcontig ( sort { $a <=> $b } keys %{$aedata{$acontig}->{$fend}} )
+              {
+                foreach my $rend ( sort keys %{$aedata{$acontig}->{$fend}->{$rcontig}} )
+                  {
+                    # currently only use defined state, values ignored for direct connections
+                    # my ( $distance, $nreads ) = @{$aepdata{$acontig}->{$fend}->{$rcontig}->{$rend}};
+
+                    # + and - are backwards from what looks natural, so that ABySS-Explorer
+                    # defaults to showing arrows 5' to 3'
+                    # 3'->5' = - -  3'->3' = - +
+                    # 5'->5' = + -  5'->3' = + +
+                    my $fdir = ($fend=~m/5/)?"+":"-";
+                    my $rdir = ($rend=~m/3/)?"+":"-";
+
+                    # print link here
+                    print $OUTF "\"${acontig}${fdir}\" -> \"${rcontig}${rdir}\"\n";
+                    debugmsg ( "AE: rcontig=$rcontig pm=$rdir link is \"${acontig}${fdir}\" -> \"${rcontig}${rdir}\"" );
+                  } # foreach $rend
+              } # foreach $rcontig
+          } # foreach $fend
+      } # foreach my $acontig %aedata
+
+    ### dist pattern
+    foreach my $acontig ( sort { $a <=> $b } keys %aepdata )
+      {
+        debugmsg ( "AE: write dist data for contig \"$acontig\"" );
+        foreach my $fend ( sort keys %{$aepdata{$acontig}} )
+          {
+            next if ( $fend !~ m/\d/ ); # i.e., ne 'used'
+            foreach my $rcontig ( sort { $a <=> $b } keys %{$aepdata{$acontig}->{$fend}} )
+              {
+                if ( $fend !~ m/p/ ) { die "Program bug: \%aepdata key for $acontig has no \"p\": \"$fend\"\n"; }
+                foreach my $rend ( sort keys %{$aepdata{$acontig}->{$fend}->{$rcontig}} )
+                  {
+                    my ( $distance, $nreads ) = @{$aepdata{$acontig}->{$fend}->{$rcontig}->{$rend}};
+                    unless ( $distance ) { die "Program bug, paired end distance not defined contig $acontig end $fend to end $rcontig end $rend\n"; }
+
+                    # 3'->5' = - -  3'->3' = - +
+                    # 5'->5' = + -  5'->3' = + +
+                    my $fdir = ($fend=~m/5/)?"+":"-";
+                    my $rdir = ($rend=~m/3/)?"+":"-";
+
+                    # special precise formatting needed by ABySS-Explorer
+                    $distance = int ( $distance + 0.5 );  # must be integer
+                    my $e = sprintf ( "%0.1f", $abyssevalue ); # units are b.p., required 1 decimal place
+                    my $n = int($nreads); # n is number of mates, must be integer, here we use the number of reads, same thing
+
+                    # print link here
+                    print $OUTF "\"${acontig}${fdir}\" -> \"${rcontig}${rdir}\" [d=$distance e=$e n=$n]\n";
+                    debugmsg ( "AE: write pe link \"${acontig}${fdir}\" -> \"${rcontig}${rdir}\" [d=$distance e=$e n=$n]" );
+                  } # foreach $rend
+              } # foreach $rcontig
+          } # foreach $fend
+      } # foreach my $acontig %aepdata
+
+    # end of file
+    print $OUTF "\}\n";
+    close $OUTF;
+
+} # sub createabyssfile
+
+
+
+############################################################
+sub createfastafile {
+############################################################
+    # global variables (command line parameters) used:
+    #   $indirname, $outfastaname
+    # other global variables uses
+    #   %seen, $bpabbreviation
+    my %fasta = ();  # store all contigs in memory
+    my $fastainfilename = $indirname;
+    unless ( $fastainfilename =~ m/\/$/ ) { $fastainfilename .= "/"; }
+    $fastainfilename .= $allcontigsfna;
+    my $lines = 0;
+    my $sequences = 0;
+    my $seqsaved = 0;
+    my $bpsaved = 0;
+    my $saveflag = 0;
+    my $id = "";
+    open ( my $INF, "<", $fastainfilename ) or die ( "Error opening input file \"$fastainfilename\": $!\n" );
+    while ( my $aline = <$INF> )
+      {
+        $lines++;
+        $aline =~ s/[\r\n]//g;
+        if ( $aline =~ m/^>([^\s]*)/ )
+          {
+            $id = $1;  # up to first white space
+            $id =~ s/contig0*//;  # remove "contig" and any leading zeroes
+            if ( $id =~ m/^\s*$/ ) { die "Error, null contig name from line $lines of file \"$fastainfilename\"\n"; }
+            $sequences++;
+            $saveflag = $seen{$id};
+          } # if
+        if ( $saveflag )
+          {
+            $fasta{$id} .= $aline . "\n";
+            unless ( $aline =~ m/^>/ )
+              {
+                $aline =~ s/[^AaCcTtGgMmRrYyKkVvHhDdBb]//g;
+                $bpsaved += length ( $aline );
+              }
+          } # if
+      } # while
+    close $INF;
+    unless ( $quiet )
+      { print "Input FASTA file contained ", commify($lines), " lines and ", commify($sequences), " sequences\n"; }
+
+    open ( my $OUTF, ">", $outfastaname ) or die ( "Error opening output file \"$outfastaname\": $!\n" );
+    foreach my $acontig ( sort { $a <=> $b } keys %seen )
+      {
+        my $seq = exists($fasta{$acontig}) ? $fasta{$acontig} : "";
+        if ( $seq )
+          { print $OUTF $seq; }
+        else
+          { print "Warning, empty sequence for contig \"$acontig\"\n"; }
+        $seqsaved++;
+      }
+    close $OUTF;
+    unless ( $quiet )
+      { print commify($seqsaved), " sequences, ", commify($bpsaved), " $bpabbreviation saved in \"$outfastaname\"\n"; }
+  } # sub createfastafile
+
+
+
+############################################################
+sub debugmsg { my ( $text, $noreturn, $nolinenum ) = @_;
+############################################################
+  if ( $debug )
+    {
+      my ($package, $filename, $line, $sub) = caller(0);
+      unless ( $nolinenum ) { $text = "Line $line: " . $text; }
+      if ( ! ( $noreturn ) ) { $text .= "\n"; }
+      print $text;
+    } # if ( $debug )
+} # sub debugmsg
+
+
+
+###############################################################
+sub expandatprefix { my ( $string ) = @_;
+###############################################################
+# some parameters with contigs can have "@xxx" used instead,
+# the text following "@" is a filename. 
+# This file contains the parameters, which will be
+# substituted in. Otherwise return the string unmodified
+  if ( $string =~ m/^\@(.*)$/ )
+    {
+      my $filename = $1;
+      open my $EFILE,"<",$filename or die ( "Error opening file \"$filename\": $!\n" );
+      my @contents = <$EFILE>;
+      close $EFILE;
+      $string = join ( ",", @contents );
+      $string =~ s/[\r\n\s]//g;
+    } # if ( $string =~ m/^\@/ )
+  return $string;
+} # sub expandatprefix
+
+
+
+###############################################################
+sub timestr {
+###############################################################
+  @_ = localtime(shift || time);
+  return(sprintf("%04d/%02d/%02d %02d:%02d", $_[5]+1900, $_[4]+1, $_[3], @_[2,1]));
+} # sub timestr
+
+
+
+###############################################################
+sub commify {
+###############################################################
+# http://perldoc.perl.org/perlfaq5.html#How-can-I-output-my-numbers-with-commas
+  local $_ = shift;
+  1 while s/^([-+]?\d+)(\d{3})/$1,$2/;
+  return $_;
+} # commify
+
+
+
+# eof
+=pod sample
+graph G
+  {
+    edge [len=1];
+    graph [overlap=none,splines=true];
+    node [shape=plaintext];
+    c12345 [label=< <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0"><TR><TD PORT="L">5'</TD><TD WIDTH="200">c12345</TD...
+    c23456 [label=< <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0"><TR><TD PORT="L">5'</TD><TD WIDTH="10">c23456</TD>...
+    c34567 [label=< <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0"><TR><TD PORT="L">5'</TD><TD WIDTH="1">c34567</TD><...
+    c45678 [label=< <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0"><TR><TD PORT="L">5'</TD><TD WIDTH="100">c45678</TD...
+
+    "c23456":L -- "c34567":R [label="31"];
+    "c34567":L -- "c45678":R [label="12"];
+    "c45678":L -- "c12345":R [label="18"];
+    "c34567":L -- "c12345":R [label="1"];
+  }
+=end

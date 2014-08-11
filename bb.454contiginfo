@@ -1,0 +1,499 @@
+#!/usr/bin/perl
+#----------------------------------------------------------#
+#        Author: Douglas Senalik dsenalik@wisc.edu         #
+#----------------------------------------------------------#
+# "Black Box" program series
+=bb
+Get information about a particular contig
+=cut bb
+use strict;
+use warnings;
+use Getopt::Long;      # for getting command line parameters
+# 1.0 - Mar 21, 2012
+my $version = "1.0";
+
+
+
+############################################################
+# configuration variables
+############################################################
+my $contiggraph   = "454ContigGraph.txt";      # standard name for this file
+my $scaffoldsfile = "454ContigScaffolds.txt";  # standard name for this file
+my $altscaffoldsfile = "454Scaffolds.txt";     # standard name for this file
+
+
+
+############################################################
+# global variables
+############################################################
+my $ansiup    = "\033[1A";  # terminal control
+(my $prognopath = $0) =~ s/^.*[\/\\]//;
+my @output = ();  # array with one element for each specified contig containing all output
+my $anyscaffolds = 0;    # true if one or more scaffolds included in @contigs
+my %scaffoldcomponents;  # used to store components of each scaffold, but only used when a scaffold is queried
+my $scaffoldstxt;        # Roche path + file with scaffold components
+
+
+
+############################################################
+# command line parameters
+############################################################
+my $infilename   = "";   # input file or directory name
+my $outfilename  = "";   # output file name
+my @contigs      = ();   # contigs to analyze
+my $showscaffold = 0;    # dump entire scaffold
+my $endsonly     = 0;    # only report on end contigs in scaffolds
+my $help         = 0;    # print help and exit
+my $quiet        = 0;    # only show errors
+my $debug        = 0;    # print extra debugging information
+GetOptions (
+            "infile|inpath=s"=> \$infilename,        # string
+            "contig=s"       => \@contigs,           # integer
+            "outfile=s"      => \$outfilename,       # string
+            "showscaffold"   => \$showscaffold,      # flag
+            "endsonly"       => \$endsonly,          # flag
+            "help"           => \$help,              # flag
+            "quiet"          => \$quiet,             # flag
+            "debug"          => \$debug);            # flag
+# debug implies not quiet
+if ( $debug ) { $quiet = 0; }
+unless ( $infilename ) { $help = 1 }
+unless ( scalar @contigs ) { $help = 1 }
+unless ( $outfilename ) { $help = 1 }
+
+
+
+############################################################
+# print help screen
+############################################################
+if ( $help )
+  {
+    print "$prognopath  version $version
+This program analyzes some of the output files from a 454
+assembly to find out everything available for a particular
+contig. This information is all contained in the
+454ContigGraph.txt file in the assembly directory.
+
+Required parameters:
+  --infile=xxx      input 454 assembly directory, or path
+                    to 454ContigGraph.txt file
+  --contig=xxx      contig to analyze ( multiple allowed )
+                    use just the number e.g. --contig=123
+                    or multiple numbers with , or ; as
+                    separator, e.g. --contig=123,16389;599
+                    For scaffolds, must use full name,
+                    e.g. --contig=scaffold01234, and then
+                    all contigs in that scaffold will be
+                    reported (also see --endsonly)
+  --outfile=xxx     output file name, use \"-\" for stdout
+Optional parameters:
+  --inpath=xxx      a synonym for --infile
+  --showscaffold    if contig is part of a scaffold, list
+                    all contigs and gaps in that scaffold
+  --endsonly        for --contig=scaffoldxxx, only report
+                    further for contigs at either end
+  --help            print this screen
+  --quiet           only print error messages
+  --debug           print extra debugging information
+";
+    exit 1;
+  } # if ( $help )
+
+
+
+############################################################
+# set up input file names with paths
+############################################################
+my $path = "";  # used for any other files from assembly directory
+# if $infilename is just the assembly directory, append file name
+if ( -d $infilename )
+  {
+    unless ( $infilename =~ m/\/$/ )
+      { $infilename .= "/"; }
+    $path = $infilename;
+    $infilename .= $contiggraph;  # i.e. "454ContigGraph.txt"
+  }
+else
+  {
+    unless ( -f $infilename )
+      { die "Error, \"$infilename\" is not a valid file name or directory\n"; }
+    ( $path = $infilename ) =~ s/\/[^\/]+$/\//;  # remove file name, leave path
+  }
+$scaffoldstxt = $path . $scaffoldsfile;  # this will only exist in paired-end assemblies
+
+
+
+############################################################
+# expand multiple contigs in --contig parameter separated by "," or ";"
+############################################################
+{
+my @tmp = @contigs;
+@contigs = ();
+foreach my $acontig ( @tmp )
+  {
+    my @tmp2 = split ( /[,;]/, $acontig );
+    push ( @contigs, @tmp2 );
+    if ( $acontig =~ m/scaffold/ ) { $anyscaffolds = 1; }
+  }
+}
+
+
+
+############################################################
+# preprocess any scaffolds to find component contigs
+############################################################
+if ( $anyscaffolds )
+  {
+    unless ( -e $scaffoldstxt )
+      { if ( -e $path . $altscaffoldsfile ) { $scaffoldstxt = $path . $altscaffoldsfile; } }
+    debugmsg ( "Preprocessing scaffolds from file \"$scaffoldstxt\"" );
+    my $nlines = 0;
+    if ( ! -e $scaffoldstxt )
+      { die "Error, you have specified one or more scaffolds, but this assembly does".
+            " not have any scaffolds, perhaps it is not a paired-end assembly\n".
+            "file \"$scaffoldstxt\" not found\n"; }
+    my $INF = stdopen ( "<", $scaffoldstxt, "scaffold components " );
+    # sample lines (tab delimited)
+    #scaffold00001   1       1515    1       W       contig00001     1         1515    +
+    #scaffold00001   1516    1988    2       N       473             fragment  yes
+    #scaffold00001   1989    3866    3       W       contig00002     1         1878    +
+    while ( my $aline = <$INF> )
+      {
+        $nlines++;
+        $aline =~ s/[\r\n]//g;
+        my @cols = split ( /\t/, $aline );
+        push ( @{$scaffoldcomponents{$cols[0]}}, \@cols );
+      }
+    stdclose ( $INF );
+    debugmsg ( commify($nlines)." lines read" );
+
+    # now add contigs in scaffolds for any scaffolds specified
+    for my $i ( 0..$#contigs )
+      {
+        my $acontig = $contigs[$i];
+        if ( $acontig =~ m/scaffold/ )
+          {
+            unless ( $scaffoldcomponents{$acontig} )
+              { die "Error, no information for scaffold \"$acontig\"\n"; }
+
+            # scaffold info for output file
+            foreach my $colsref ( @{$scaffoldcomponents{$acontig}} )
+              {
+                my @tmp = @{$colsref};
+                shift ( @tmp );  # discard first column, the scaffold id
+                $output[$i] .= join ( "\t", @tmp ) . "\n";
+              }
+
+            # add component contigs of scaffold for further lookup
+            my $lasti = $#{$scaffoldcomponents{$acontig}};
+            for my $j ( 0..$lasti )
+              {
+                my $colsref = $scaffoldcomponents{$acontig}->[$j];
+                if ( ( ! $endsonly ) or ( $j == 0 ) or ( $j == $lasti ) )  # only end contigs if so desired
+                  {
+                    if ( $colsref->[5] =~ s/contig// )  # skip the fragments
+                      {
+                        debugmsg ( "Adding contig \"$colsref->[5]\" belonging to \"$acontig\"" );
+                        push ( @contigs, $colsref->[5] );
+                        my $hdr = "contig$colsref->[5] was added as part of \"$acontig\"";
+                        if ( $j == 0 ) { $hdr .= " (5' beginning)"; }
+                        if ( $j == $lasti ) { $hdr .= " (3' end)"; }
+                        $hdr .= " from " . $colsref->[1] . " to " . $colsref->[2];
+                        $output[$#contigs] = $hdr . "\n";
+                      }
+                  }
+              } # else all contigs
+          } # if a scaffold
+      } # for $i
+  } # if ( $anyscaffolds )
+
+
+
+############################################################
+# main loop
+############################################################
+debugmsg ( "Opening input file \"$infilename\"" );
+my $INF = stdopen( "<", $infilename );
+while ( my $aline = <$INF> )
+  {
+    $aline =~ s/[\r\n]//g;
+    my @cols = split ( /\t/, $aline );
+
+    for ( my $i=0; $i<=$#contigs; $i++ )
+      {
+        my $acontig = $contigs[$i];
+        next if ( $acontig =~ m/scaffold/ );  # these were handled earlier
+
+        # http://contig.wordpress.com/2010/04/13/newbler-output-iii-the-454contiggraph-txt-file
+        if ( $cols[0] eq "C" )  # Edges
+          {
+            if ( $acontig eq $cols[1] )
+              { $output[$i] .= "Edge\t$cols[2]\tConnects to contig\t$cols[3]\t$cols[4]\twith\t$cols[5]\treads\n"; }
+            if ( $acontig eq $cols[3] )
+              { $output[$i] .= "Edge\t$cols[4]\tConnects to contig\t$cols[1]\t$cols[2]\twith\t$cols[5]\treads\n"; }
+          } # "C"
+        elsif ( $cols[0] eq "S" )  # Scaffolds
+          {
+            # sample line for version 2.5.3:
+            #S  158     122973  6245:+;gapBothNoEdges:1965;6246:+;gapBothNoEdges:201;6247:+;gapBothNoEdges:277;6248:+
+            if ( $aline =~ m/$acontig/ )  # to save time, a quick check before we do more processing, but may be false hit
+              {
+                my $hit = 0;
+                my @scaftxt = ();
+                my @cols = split ( /\t/, $aline );
+                if ( defined $cols[3] )
+                  {
+                    foreach my $asect ( split ( /;/, $cols[3] ) )
+                      {
+                        # will be either contig, e.g. "1034:+" or a gap e.g. "gap:118"
+                        if ( $asect =~ m/^(\d+):(.*)$/ ) # is a contig number, not a gap
+                          {
+                            my $ctg = $1;
+                            my $dir = $2;
+                            if ( $ctg eq $acontig )  # hit
+                              {
+                                $output[$i] .= "Part of scaffold $cols[1] which is $cols[2] b.p. long\n";
+                                $hit = 1;
+                              } # hit
+                            if ( $showscaffold )
+                              {
+                                $dir =~ s/\+/forward/;
+                                $dir =~ s/\-/reverse/;
+                                push ( @scaftxt, "  Contig\t$ctg\t$dir\n" );
+                              }
+                          } # is a contig number
+                        else
+                          {
+                            if ( $showscaffold )
+                              {
+                                $asect =~ s/:/\t/;
+                                push ( @scaftxt, "  $asect\n" );
+                              }
+                          }
+                      } # foreach
+                  } # if ( defined $cols[3] )
+else { print "Undef [3] line \"$aline\"\n"; } #@@@
+                if ( ( $hit ) and ( $showscaffold ) )
+                  {
+                    $output[$i] .= join ( "", @scaftxt );
+                  }
+               } # quick preliminary scan pass
+          } # "S"
+        elsif ( $cols[0] eq "I" )  # Through-flow information
+          {
+            if ( $acontig eq $cols[1] )
+              {
+                $output[$i] .= "Flowthrough\t$cols[2]\t$cols[3]\n";
+              }
+          } # "I"
+        elsif ( $cols[0] eq "F" )  # Single end read flow information
+          {
+            if ( $acontig eq $cols[1] )
+              {
+                foreach my $apart ( split ( /;/, $cols[2] ) )
+                  {
+                    if ( $apart eq "-" )
+                      { $output[$i] .= "No\treads flow from 5' end of contig$cols[1]\n"; }
+                    else
+                      {
+                        my @f = split ( /\//, $apart );
+                        $output[$i] .= "$f[1]\treads flow from 5' end of contig$cols[1] and terminate in contig\t$f[0]";
+                        if ( $f[2] > 0 )
+                          { $output[$i] .= "\tafter passing through\t$f[2]\tb.p. in other contig(s)\n"; }
+                        else
+                          { $output[$i] .= "\n"; }
+                      }
+                  }
+
+                foreach my $apart ( split ( /;/, $cols[3] ) )
+                  {
+                    if ( $apart eq "-" )
+                      { $output[$i] .= "No\treads flow from 3' end of contig$cols[1]\n"; }
+                    else
+                      {
+                        my @f = split ( /\//, $apart );
+                        $output[$i] .= "$f[1]\treads flow from 3' end of contig$cols[1] and terminate in contig\t$f[0]";
+                        if ( $f[2] > 0 )
+                          { $output[$i] .= "\tafter passing through\t$f[2]\tb.p. in other contig(s)\n"; }
+                        else
+                          { $output[$i] .= "\n"; }
+                      }
+                  }
+              }
+          } # "F"
+        elsif ( $cols[0] eq "P" )  # Paired end read flow information
+          {
+            if ( $acontig eq $cols[1] )
+              {
+                foreach my $apart ( split ( /;/, $cols[2] ) )
+                  {
+                    if ( $apart eq "-" )
+                      { $output[$i] .= "No\tpaired end reads flow from 5' end of contig$cols[1]\n"; }
+                    else
+                      {
+                        my @f = split ( /\//, $apart );
+                        $output[$i] .= "$f[1]\tpaired end reads flow from 5' end of contig$cols[1] and terminate in contig\t$f[0]";
+                        if ( $f[2] > 0 )
+                          { $output[$i] .= "\tafter passing through\t$f[2]\tb.p. in other contig(s)\n"; }
+                        else
+                          { $output[$i] .= "\n"; }
+                      }
+                  }
+
+                foreach my $apart ( split ( /;/, $cols[3] ) )
+                  {
+                    if ( $apart eq "-" )
+                      { $output[$i] .= "No\tpaired end reads flow from 3' end of contig$cols[1]\n"; }
+                    else
+                      {
+                        my @f = split ( /\//, $apart );
+                        $output[$i] .= "$f[1]\tpaired end reads flow from 3' end of contig$cols[1] and terminate in contig\t$f[0]";
+                        if ( $f[2] > 0 )
+                          { $output[$i] .= "\tafter passing through\t$f[2]\tb.p. in other contig(s)\n"; }
+                        else
+                          { $output[$i] .= "\n"; }
+                      }
+                  }
+              }
+          } # "P"
+        else  # first section
+          {
+            if ( $acontig eq $cols[0] )
+              {
+                $output[$i] .= "Length\t$cols[2]\n";
+                $output[$i] .= "Average Coverage\t$cols[3]\n";
+              }
+          } # first section
+      } # for $i
+
+  } # while <$INF>
+stdclose ( $INF );
+
+
+
+############################################################
+# write collected data to output file
+############################################################
+my $OUTF = stdopen ( ">", $outfilename );
+for ( my $i=0; $i<=$#contigs; $i++ )
+  {
+    my $pfx = "contig";
+    if ( $contigs[$i] =~ m/scaffold/ ) { $pfx = ""; }
+    print $OUTF ">$pfx$contigs[$i]\n";
+    if ( defined $output[$i] )
+      { print $OUTF $output[$i]; }
+    else
+      { print $OUTF "No data found!\n"; }
+    print $OUTF "\n";
+  } # for $i
+stdclose ( $OUTF );
+
+
+
+unless ( $quiet )
+  { print "Done\n"; }
+exit 0;
+
+
+
+############################################################
+sub debugmsg { my ( $text, $noreturn, $nolinenum ) = @_;
+############################################################
+  if ( $debug )
+    {
+      my ($package, $filename, $line, $sub) = caller(0);
+      unless ( $nolinenum ) { $text = "Line $line: " . $text; }
+      if ( ! ( $noreturn ) ) { $text .= "\n"; }
+      print $text;
+    } # if ( $debug )
+} # sub debugmsg
+
+
+
+###############################################################
+sub timestr {
+###############################################################
+  @_ = localtime(shift || time);
+  return(sprintf("%04d/%02d/%02d %02d:%02d", $_[5]+1900, $_[4]+1, $_[3], @_[2,1]));
+} # sub timestr
+
+
+
+###############################################################
+sub commify {
+###############################################################
+# http://perldoc.perl.org/perlfaq5.html#How-can-I-output-my-numbers-with-commas
+  local $_ = shift;
+  1 while s/^([-+]?\d+)(\d{3})/$1,$2/;
+  return $_;
+} # commify
+
+
+
+###############################################################
+sub stdopen { my ( $mode, $filename, $extratext ) = @_;
+###############################################################
+# a replacement for the three-parameter open which also allows
+# the use of "-" as the file name to mean STDIN or STDOUT
+  my $fh;  # the file handle
+  if ( $filename eq "-" )  # only exact match to "-" has special meaning
+    {
+      if ( $mode =~ m/>/ )
+        { $fh = *STDOUT }
+      else
+        { $fh = *STDIN }
+    }
+  else
+    {
+      # supplemental passed text for error messages, need one more space
+      if ( defined $extratext )
+        { $extratext .= " " }
+      else
+        { $extratext = "" }
+
+      my $text;  # this is only used for error message
+      if ( $mode =~ m/^\+?>>/ )  # ">>" or "+>>"
+        { $text = "append" }
+      elsif ( $mode =~ m/^\+?>/ )  # ">" or "+>"
+        { $text = "output" }
+      elsif ( $mode =~ m/^\+?</ )  # "<" or "+<"
+        { $text = "input" }
+      elsif ( $mode eq "-|" )
+        { $text = "piped input" }
+      elsif ( $mode eq "|-" )
+        { $text = "piped output" }
+      else
+        { die "Error, unsupported file mode \"$mode\" specified to stdopen( $mode, $filename, $extratext )\n"; }
+
+      # if file name ends in ".gz", gzip compression is assumed, and handle it transparently
+      if ( $filename =~ m/\.gz$/ )
+        {
+          if ( $mode =~ m/^>$/ ) # output mode
+            { $mode = "|-"; $filename = "gzip -c > \"$filename\""; }
+          elsif ( $mode =~ m/^<$/ ) # input mode
+            { $mode = "-|"; $filename = "gunzip -c \"$filename\""; }
+          else
+            { die "Error, can't handle gzip compression with mode \"$mode\" for file \"filename\"\n"; }
+        } # if gzip compressed file
+      open ( $fh, $mode, $filename ) or die ( "Error opening ${extratext}file \"$filename\" for $text: $!\n" );
+    }
+  # return the opened file handle to the caller
+  return $fh;
+} # stdopen
+
+
+
+###############################################################
+sub stdclose { my ( $fh ) = @_;
+###############################################################
+# same as built-in close, except in case of STDIN or STDOUT,
+# and in this case the file handle is not closed
+
+  unless ( fileno($fh) <= 2 )  # if file number is this low, is stdin or stdout or stderr
+    { close ( $fh ) or die ( "Error closing file handle: $!\n" ); }
+
+} # sub stdclose
+
+
+
+# eof

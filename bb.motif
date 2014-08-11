@@ -1,0 +1,750 @@
+#!/usr/bin/perl
+#----------------------------------------------------------#
+#        Author: Douglas Senalik dsenalik@wisc.edu         #
+#----------------------------------------------------------#
+# "Black Box" program series
+=bb
+Find a motif in one or more fasta sequences, and create
+a summary report
+=cut bb
+# Version 1.0 - June 14, 2010
+use strict;
+use Getopt::Long;      # for getting command line parameters
+
+
+
+############################################################
+# configuration variables
+############################################################
+my $defaulttempdir = "/tmp/";
+my $bl2seq = "/usr/local/bin/blast-2.2.22/bin/bl2seq";
+my $blastprogram = "blastn";
+my $charmatch = "|";
+my $charmismatch = "*";
+my $charoutofmotif = " ";
+my $charnomotif = "-";
+my @validchars = ( 'A', 'C', 'G', 'T' );
+my $dividerline = "----------\n\n";
+
+
+
+############################################################
+# global variables
+############################################################
+my $keeptempfiles = 0;
+my @sequences = ();  # array with each fasta sequence from input file as an element
+my $tmpmotiffile = "";
+my $tmpseqfile   = "";
+my $tmpblastfile = "";
+my @startmotif = ();     # flag for base 1 of motif in subject
+my @stopmotif = ();     # flag for last base of motif in subject
+my $charmatchmeta = quotemeta($charmatch);
+my $charmismatchmeta = quotemeta($charmismatch);
+my @motifstats = ();  # array of hashes for each letter seen
+
+
+
+############################################################
+# get command line parameters
+############################################################
+my $motif = "";
+my $infile = ();
+my $outfile = "";
+my $tbl2asnfile = "";
+my $tempdir = "";
+my $expect = "10.0";
+my $help = 0;
+my $debug = 0;
+# get command line options
+GetOptions ("motif=s"        => \$motif,             # string
+            "infile=s"       => \$infile,            # string
+            "outfile=s"      => \$outfile,           # string
+            "tbl2asn=s"       => \$tbl2asnfile,        # string
+            "tempdir=s"      => \$tempdir,           # string
+            "expect=s"       => \$expect,            # string
+            "help"           => \$help,              # flag
+            "debug"          => \$debug);            # flag
+
+
+
+############################################################
+# print help screen
+############################################################
+unless ( ( $infile ) and ( $outfile ) and ( $motif ) ) { $help = 1; }
+if ( $help )
+  {
+    print "This program will take one or more sequences in a FASTA
+file, and look for your specified motif sequence in them.
+
+Required parameters:
+  --motif=xxx        nucleotide sequence of the motif to find
+  --infile=xxx       name of input FASTA file, multiple allowed
+  --outfile=xxx      name of summary file to create
+Optional parameters:
+  --tbl2asnfile=xxx  create a feature table for tbl2asn import
+  --tempdir=xxx      save intermediate files in this directory.
+                     If not specified, temporary files are not kept
+  --expect=xxx       expect value for blast, default = $expect
+  --debug            debugging mode=extra info printed, keep temp files
+  --help             print this screen\n";
+    exit 1;
+  } # if ( $help )
+
+
+
+############################################################
+# initialize some variables
+############################################################
+print "Starting at ", timestr(), "\n";
+if ( $tempdir )
+  {
+    # make sure trailing slash is present
+    unless ( $tempdir =~ m/\/$/ )
+      { $tempdir .= "/"; }
+    unless ( -d $tempdir )
+      { die "Error, temporary directory \"$tempdir\" does not exist or is not a directory"; }
+    $keeptempfiles = 1;
+  }
+else
+  { $tempdir = $defaulttempdir; }   
+if ( $debug ) { $keeptempfiles = 1; }
+my $tmpprefix = $tempdir . "bb.motiffinder";
+my $tmplog = $tmpprefix . ".log";
+$tmpmotiffile = $tmpprefix . ".motif.tmp";
+$tmpseqfile = $tmpprefix . ".subject.tmp";
+$tmpblastfile = $tmpprefix . ".blastoutput.tmp";
+
+
+
+############################################################
+# read input file into memory
+############################################################
+my $numseq = 0;
+open INP,"<$infile" or die "Error opening input file \"$infile\": $!\n";
+while ( my $aline = <INP> )
+  {
+    $aline =~ s/[\r\n]//g;
+    if ( $aline =~ m/^>/ )
+      {
+        $numseq++;
+        $aline .= "\n";
+      }
+    $sequences[$numseq-1] .= $aline;
+  } # while <INP>
+close INP;
+if ( $numseq )
+  { print "Loaded $numseq sequences from input file \"$infile\"\n"; }
+else
+  { die "Error, no sequences found in \"$infile\"\n"; }
+
+
+
+############################################################
+# create temporary file for motif
+############################################################
+$motif =~ s/[^ABCDGHKMNRSTVWYabcdghkmnrstvwy]//g;  # remove all non-DNA characters
+my $motiflen = length ( $motif );
+print "Motif length is $motiflen\n";
+my @motifarr = split ( //, "!" . $motif );  # we don't use array index [0]
+( my $motifC = $motif ) =~  tr/AaCcTtGgMmRrYyKkVvHhDdBb/TtGgAaCcKkYyRrMmBbDdHhVv/;;
+my @motifarrC = split ( //, "!" . $motifC );
+unless ( $motif ) { die "Error, no motif has been defined\n"; }
+open TMP,">$tmpmotiffile" or die "Error creating temporary motif file \"$tmpmotiffile\": $!\n";
+print TMP ">Motif\n";
+print TMP "$motif\n";
+close TMP;
+
+
+
+############################################################
+# open output files
+############################################################
+open OUT,">$outfile" or die "Error creating output file \"$outfile\": $!\n";
+print OUT "MotifFinder analysis using motif \"$motif\", length=$motiflen\n";
+print OUT "Numbers after each motif represent\n";
+print OUT "Number of matches to this motif ; Number of gaps on motif side ; Number of gaps on subject side / Length of motif found\n";
+print OUT $dividerline;
+
+if ( $tbl2asnfile )
+  { open SEQ,">$tbl2asnfile" or die "Error creating tbl2asn output file \"$tbl2asnfile\": $!\n"; }
+
+
+
+############################################################
+# loop for each sequence in input file
+############################################################
+foreach my $inseq ( @sequences )
+  {
+    @startmotif = ();
+    @stopmotif = ();
+    my $foundany = 0;
+
+    my ( $header, $seq ) = split ( /\n/, $inseq );  # all other returns were already stripped
+    $header =~ s/^>//;
+    $seq =~ s/[^ABCDGHKMNRSTVWYabcdghkmnrstvwy]//g;  # remove all non-DNA characters
+    my @seqarr = split ( //, "!" . $seq );  # we won't use array index [0]
+    my @matcharr = ( "!" );
+
+    # create temporary input file with sequence
+    open TMP,">$tmpseqfile" or die "Error creating temporary sequence file \"$tmpseqfile\": $!\n";
+    print TMP ">", $header, "\n";
+    print TMP $seq, "\n";
+    close TMP;
+
+    # run blast2seq
+    my $cmd = $bl2seq;
+    $cmd .= " -i \"$tmpmotiffile\"";
+    $cmd .= " -j \"$tmpseqfile\"";
+    $cmd .= " -p \"$blastprogram\"";
+    $cmd .= " -o \"$tmpblastfile\"";
+    $cmd .= " -e \"$expect\"";
+    $cmd .= " -D 0";  # output format traditional
+    $cmd .= " -F F";  # filter off
+    $cmd .= " -G -1";  # gap open penalty
+    $cmd .= " -E -1";  # gap extension penalty
+    $cmd .= " -q -3"; # penalty for mismatch default -3
+    $cmd .= " -r 2";  # reward for match default 1
+
+    my $result = system ( $cmd );
+    if ( $result ) { die "Error $result running \"$cmd\"\n"; }
+
+    # print header in output file for this sequence
+    print OUT "Analysis of \"$header\"\n";
+
+    # parse results
+    my $qpos1 = 0;
+    my $qpos2 = 0;
+    my $qseq = "";
+    my $qseqlen = 0;
+    my @qarr = ();
+    my @qgaps = ();
+    my $qdirection = 0;
+
+    my $spos1 = 0;
+    my $spos2 = 0;
+    my @sarr = ();
+    my @sgaps = ();
+    my $sseq = "";
+    my $sseqlen = 0;
+    my $sdirection = 0;
+
+    my @midx = ();  # motif index
+    my @mor = ();   # motif orientation, 1 forward, -1 reverse
+    my $linenum = 0;
+
+    open TMP,"<$tmpblastfile" or die "Error opening blast output file \"$tmpblastfile\": $!\n";
+    while ( my $aline = <TMP> )
+      {
+        if ( $debug ) { print $aline; }
+        $linenum++;
+        $aline =~ s/[\r\n]//g;
+
+        # parse Query: line
+        if ( $aline =~ m/^Query:\s+(\d+)\s+(.+)\s+(\d+)/ )
+          {
+            $qpos1 = $1;
+            $qpos2 = $3;
+            $qseq = $2;
+            $qseqlen = length( $qseq );
+            if ( $qpos2 < $qpos1 )
+              { $qdirection = -1; }
+            else
+              { $qdirection = 1; }
+            $foundany = 1;
+          } # if ( $aline =~ m/^Query/ )
+
+        # parse Sbjct: line
+        if ( $aline =~ m/^Sbjct:\s+(\d+)\s+(.+)\s+(\d+)/ )
+          {
+            $spos1 = $1;
+            $spos2 = $3;
+            $sseq = $2;
+            $sseqlen = length( $sseq );
+            if ( $spos2 < $spos1 )
+              { $sdirection = -1; }
+            else
+              { $sdirection = 1; }
+if ( $qdirection == -1 ) { print "query is RC\n"; }
+if ( $sdirection == -1 ) { print "sbjct is RC\n"; }
+            # look at each character and either store base or store a gap
+            my $qindex = $qpos1;  # storage location index
+            my $sindex = $spos1;  # storage location index
+            for ( my $i=0; $i<$sseqlen; $i++ )
+              {
+                # motifindex
+                $midx[$sindex] = $qindex;
+##print "Motif index for $sindex set to $qindex\n";
+
+                # QUERY ( = motif )
+                my $qletter = substr ( $qseq, $i, 1 );
+                if ( $qletter =~ m/[A-Za-z]/ )
+                  {
+##print "store q $qletter at $sindex\n";
+                    $qarr[$sindex] = $qletter;  # note use of $sindex here
+                    $qindex += $qdirection;
+                  }
+                elsif ( $qletter eq "-" )
+                  {
+##print "Query gap at $i\n";
+                    if ( $qdirection > 0 )
+                      { $qgaps[$qindex-1]++; }
+                    else
+                      { $qgaps[$qindex]++; }
+                  }
+                else
+                  { die "Invalid query letter \"$qletter\" line $linenum:\"$aline\"\n"; }
+
+                # SBJCT ( = sequence being analyzed )
+                my $sletter = substr ( $sseq, $i, 1 );
+                if ( $sletter =~ m/[A-Za-z]/ )
+                  {
+##print "store s $sletter at $sindex\n";
+                    $sarr[$sindex] = $sletter;
+                    $sindex += $sdirection;
+                  }
+                elsif ( $sletter eq "-" )
+                  {
+                    if ( $sdirection > 0 )
+                      { $sgaps[$sindex-1]++; }
+                    else
+                      { $sgaps[$sindex]++; }
+                  }
+                else
+                  { die "Invalid sbjct letter \"$sletter\" line $linenum:\"$aline\"\n"; }
+
+                # save orientation
+                $mor[$sindex] = ( $qdirection * $sdirection );
+
+              } # for
+          } # if ( $aline =~ m/^Sbjct/ )
+
+      } # while <TMP>
+    close TMP;
+
+
+
+    # extrapolate motif index on each end.
+    # first do lower numbers, then on a second pass do higher numbers
+    my $prevval = 0;
+    my $prevor = 0;
+    for ( my $i=$#seqarr; $i>=1; $i-- )
+      {
+        if ( ( $prevval > 1 ) and ( $prevval < $motiflen ) and ( ! $midx[$i] ) )
+          {
+            my $tmp = ( $prevval - $prevor );
+            if ( $midx[$i-1] != $tmp ) { $midx[$i] = $tmp; }
+            $mor[$i] = $prevor;
+            if ( $debug ) { print "Extrapolating motif down, $midx[$i] at $i orient=$prevor\n"; }
+          }
+        $prevval = $midx[$i];
+        if ( $mor[$i] != 0 ) { $prevor = $mor[$i]; }
+      } # for $i
+    $prevval = 0;
+    for ( my $i=1; $i<=$#seqarr; $i++ )
+      {
+        if ( ( $prevval > 1 ) and ( $prevval < $motiflen ) and ( ! $midx[$i] ) )
+          {
+            my $tmp = ( $prevval + $prevor );
+            if ( $midx[$i+1] != $tmp ) { $midx[$i] = $tmp; }
+            $mor[$i] = $prevor;
+            if ( $debug ) { print "Extrapolating motif up, $midx[$i] at $i orient=$prevor\n"; }
+          }
+        $prevval = $midx[$i];
+        if ( $mor[$i] != 0 ) { $prevor = $mor[$i]; }
+      } # for $i
+
+    # find elements
+    if ( $tbl2asnfile )
+      {
+        my @left = ();
+        my @right = ();
+        my $inelement = 0;
+        my $previdx = 0;
+        for ( my $i=1; $i<=$#seqarr; $i++ )
+          {
+            if ( $inelement )
+              {
+                if ( $midx[$i] )
+                  {
+                    # only do anything at border
+                    if ( abs ( $previdx - $midx[$i] ) > 3 )
+                      {
+                        push ( @right, $i-1 );
+                        push ( @left, $i );
+                      }
+                    $previdx = $midx[$i];
+                  }
+                else
+                  {
+                    $inelement = 0;
+                    push ( @right, $i-1 );
+                  }
+              }
+            else
+              {
+                if ( $midx[$i] )
+                  {
+                    $inelement = 1;
+                    $previdx = $midx[$i];
+                    push ( @left, $i );
+                  }
+              }
+
+          } # for $i
+        if ( $inelement ) { push ( @right, $#seqarr ); }
+        if ( scalar @left )
+          {
+            # header must only be identifier, right trim after first space
+            my $tmphdr = $header;
+            $tmphdr =~ s/ .*$//;
+
+            print SEQ ">Feature ", $tmphdr, "\n";
+            for ( my $i=0; $i<=$#left; $i++ )
+              {
+                print SEQ "$left[$i]\t$right[$i]\trepeat_region\t\t\n";
+                print SEQ "\t\t\tnote\tCent-Dc repeat element\n";
+              }
+          }
+      } # if ( $tbl2asnfile )
+
+    if ( $foundany )
+      {
+    # print the output, in 3-line format when motif present, 1-line when absent
+    my $o1 = "    1 ";
+    my $o2 = "      ";
+    my $o3 = "      ";
+    my $linelen = 0;
+    my $inmotif = 0;
+    my $motifmatch = 0;
+    my $motifmismatch = 0;
+    my $motiforient = 0;  # +1 for forward (same as sbjct), -1 for reverse, 0 for no motif here
+    my $prevmotiforient = 0;
+    my $prevmidx;         # for finding orientation in $motiforient
+    for ( my $i=1; $i<=$#seqarr; $i++ )
+      {
+        if ( $debug and 0 )
+          { print "\$i=$i \$seqarr[$i]=\"$seqarr[$i]\" ",
+                  "\$sarr[$i]=\"$sarr[$i]\" ",
+                  "\$qarr[$i]=\"$qarr[$i]\" ",
+                  "\$sgaps[$i]=\"$sgaps[$i]\" ",
+                  "\$qgaps[$i]=\"$qgaps[$i]\" ",
+                  "\$midx[$i]=\"$midx[$i]\"\n"; }
+
+        # determine motif orientation
+        $motiforient = $mor[$i];
+
+        # summary statistics for motif letters observed
+        if ( $midx[$i] )
+          {
+##print "Store at index $i letter $seqarr[$i] motif index $midx[$i]\n";
+            $motifstats[$midx[$i]]->{$seqarr[$i]}++;
+          }
+
+        $o1 .= $seqarr[$i];
+        my $tmp = " ";
+        if ( $midx[$i] )
+          {
+            if ( $mor[$i] < 0 )
+              { $tmp = $motifarrC[$midx[$i]]; }
+            else
+              { $tmp = $motifarr[$midx[$i]]; }
+          }
+        $o3 .= $tmp;
+
+        # show matches between motif and sequence
+        if ( $seqarr[$i] =~ m/^$tmp$/i )
+          { $o2 .= $charmatch; $motifmatch++; }
+        elsif ( $midx[$i] )
+          { $o2 .= $charmismatch; $motifmismatch++; }
+        else
+          { $o2 .= $charoutofmotif; }
+        $linelen++;
+
+        # add gaps in sequence
+        if ( $sgaps[$i] )
+          {
+            if ( $debug ) { print "Adding sbjct gap len=$sgaps[$i] at $i\n"; }
+##print "Adding sbjct gap len=$sgaps[$i] at $i \n";
+            for ( my $j=0; $j<$sgaps[$i]; $j++ )
+              {
+                $o1 .= "-";
+                $o2 .= $charmismatch;
+                my $tmp = " ";
+                if ( $midx[$i] )
+                  {
+                    if ( $mor[$i] < 0 )
+                      { $tmp = $motifarrC[$midx[$i+$j] - 1]; }
+                    else
+                      { $tmp = $motifarr[$midx[$i+$j] + 1]; }
+                  }
+##print "i $i j $j motif index $midx[$i+$j] Added $tmp\n";
+                $o3 .= $tmp;
+                $linelen++;
+              }
+          } # add gaps
+
+if ( 0 ) {
+        # add gaps in motif (query)
+        if ( $qgaps[$i] )
+          {
+            if ( $debug ) { print "Adding query gap len=$qgaps[$i] at $i\n"; }
+            for ( my $j=0; $j<$qgaps[$i]; $j++ )
+              {
+                $o3 .= " ";
+                $o2 .= "^";
+                my $tmp = "#";
+                $o1 .= $tmp;
+                $linelen++;
+              }
+          } # add gaps
+}
+
+
+        # line break rules
+        my $break = 0;
+        # old motif ends and new one starts
+        if ( $motiforient == 1 )
+          {
+            if ( $midx[$i] > $midx[$i+1] ) { $break = 1; }
+          }
+        if ( $motiforient == -1 )
+          {
+            if ( $midx[$i] < $midx[$i+1] ) { $break = 1; }
+          }
+        # no motif, line length over limit
+        if ( $linelen >= 60 ) { $break = 1; }
+        # new motif starts after no motif, and existing sequence ( > 5 bp ) on line
+        if ( ( $linelen >= 5 ) and ( $midx[$i+1] ) and ( ! $midx[$i] ) ) { $break = 1; }
+        # motif ends and no new one starts
+        if ( ( ! $midx[$i+1] ) and ( $midx[$i] ) ) { $break = 1; }
+        # don't break for short lines
+        if ( $linelen < 5 ) { $break = 0; }
+
+
+        if ( $break )
+          {
+            print OUT $o1, "\n";
+##if ( $o3 ) { print "\"$o3\" eval to true\n"; } else { print "\"$o3\" eval to false\n"; }
+            unless ( $o3 =~ m/^\s*$/ )
+              {
+                print OUT $o2, "\n";
+                $o3 =~ s/^     /Motif/;
+                print OUT $o3, calcscore($o1,$o2,$o3,$motiforient), "\n";
+              }
+            print OUT "\n";
+            $o1 = sprintf ( "%5d ", $i+1 );  # + 1 because will be for next loop
+            $o2 = "      ";
+            $o3 = "      ";
+            $linelen = 0;
+          }
+        $prevmidx = $midx[$i];
+        $prevmotiforient = $motiforient;
+      } # for   
+    # print anything leftover at the end
+    if ( $linelen )
+      {
+        print OUT $o1, "\n";
+        unless ( $o3 =~ m/^\s*$/ )
+          {
+            print OUT $o2, "\n";
+            if ( $o3 ) { $o3 =~ s/^     /Motif/; }
+            print OUT $o3, calcscore($o1,$o2,$o3,$prevmotiforient), "\n";
+          }
+      }
+
+      } # if ( $foundany )
+    else
+      { print OUT "No motifs found in this sequence\n"; }
+
+    # cleanup temporary files from this loop
+    unlink $tmpseqfile;
+    unlink $tmpblastfile;
+
+    print OUT $dividerline;
+
+  } # foreach my $inseq ( @sequences )
+
+
+
+############################################################
+# motif statistics
+############################################################
+print OUT "Motif Summary Statistics\n";
+print OUT "\n";
+
+# print a header for each column
+print OUT "Position  Motif";
+my @pct = @validchars;
+foreach ( @pct ) { s/^/% /; }
+foreach my $base ( @validchars, "Total", @pct, " %Motif" )
+  { print OUT sprintf ( " %5s", $base ); }
+print OUT "\n";
+
+for ( my $i=1; $i<=$#motifarr; $i++ )
+  {
+    print OUT sprintf ( "%6d %6s  ", $i, $motifarr[$i] );
+    my $total = 0;
+    foreach my $base ( @validchars )
+      {
+        print OUT sprintf ( " %5d", $motifstats[$i]->{$base} );
+        $total += $motifstats[$i]->{$base};
+      }
+    print OUT sprintf ( " %5d", $total );
+    my $highest = 0;
+    my $highestltr = "";
+    foreach my $base ( @validchars )
+      {
+        my $pct = ( $motifstats[$i]->{$base} * 100 / $total );
+        print OUT sprintf ( " %5.1f", $pct );
+        if ( $pct > $highest )
+          {
+            $highest = $pct;
+            $highestltr = $base;
+          }
+      }
+    print OUT sprintf ( " %5.1f", $highest ), "%", $highestltr;
+    if ( $highestltr ne $motifarr[$i] ) { print OUT " DIFFERENT FROM MOTIF"; }
+    print OUT "\n";
+  } # for
+
+
+
+############################################################
+# close output file and cleanup
+############################################################
+if ( $tbl2asnfile ) { close SEQ; }
+close OUT;
+unlink ( $tmpmotiffile );
+print "Program finished at ", timestr(), "\n";
+exit 0;
+
+
+
+
+
+############################################################
+sub calcscore { my ( $o1, $o2, $o3, $orient ) = @_;
+############################################################
+  my $matches = 0;
+  my $mismatches = 0;
+  my $qgaps = 0;
+  my $sgaps = 0;
+  while ( $o1 =~ m/-/g ) { $sgaps++; }
+  while ( $o2 =~ m/$charmatchmeta/g ) { $matches++; }
+  while ( $o2 =~ m/$charmismatchmeta/g ) { $mismatches++; }
+  while ( $o3 =~ m/-/g ) { $qgaps++; }
+  my $tmp = "  " . $matches . ";" . $qgaps . ";" . $sgaps . "/" . ( $matches + $mismatches );
+  if ( $orient == 1 )
+    { $tmp .= ""; }
+  elsif ( $orient == -1 )
+    { $tmp .= " Reverse Complement"; }
+  else
+    { $tmp .= " ERR"; }
+  return $tmp;
+} # sub calcscore
+
+
+
+###############################################################
+sub timestr
+###############################################################
+  {
+    @_ = localtime(shift || time);
+    return(sprintf("%04d/%02d/%02d %02d:%02d", $_[5]+1900, $_[4]+1, $_[3], @_[2,1]));
+  } # sub timestr
+
+
+
+###############################################################
+sub commify
+###############################################################
+# http://perldoc.perl.org/perlfaq5.html#How-can-I-output-my-numbers-with-commas$
+  {
+    local $_ = shift;
+    1 while s/^([-+]?\d+)(\d{3})/$1,$2/;
+    return $_;
+  } # commify
+
+
+
+############################################################
+sub revcomp { my ( $dna ) = @_;
+############################################################
+# standard DNA reverse complement, including degenerate bases
+  my $revcomp = reverse ( $dna );
+  $revcomp =~ tr/AaCcTtGgMmRrYyKkVvHhDdBb/TtGgAaCcKkYyRrMmBbDdHhVv/;
+  return $revcomp;
+} # sub revcomp
+
+
+
+############################################################
+sub debugmsg { my ( $text, $noreturn, $nolinenum ) = @_;
+############################################################
+  if ( $debug )
+    {
+      my ($package, $filename, $line, $sub) = caller(0);
+      unless ( $nolinenum ) { $text = "Line $line: " . $text; }
+      if ( ! ( $noreturn ) ) { $text .= "\n"; }
+      print $text;
+    } # if ( $debug )
+} # sub debugmsg
+
+
+
+# for reference purposes
+=pod
+
+bl2seq 2.2.22   arguments:
+
+  -i  First sequence [File In]
+  -j  Second sequence [File In]
+  -p  Program name: blastp, blastn, blastx, tblastn, tblastx. For blastx 1st sequence should be nucleotide, tblastn 2nd sequence nucleotide [String]
+  -g  Gapped [T/F]
+    default = T
+  -o  alignment output file [File Out]
+    default = stdout
+  -d  theor. db size (zero is real size) [Real]
+    default = 0
+  -a  Text ASN.1 output file [File Out]  Optional
+  -G  Cost to open a gap (-1 invokes default behavior) [Integer]
+    default = -1
+  -E  Cost to extend a gap (-1 invokes default behavior) [Integer]
+    default = -1
+  -X  X dropoff value for gapped alignment (in bits) (zero invokes default behavior)
+      blastn 30, megablast 20, tblastx 0, all others 15 [Integer]
+    default = 0
+  -W  Word size, default if zero (blastn 11, megablast 28, all others 3) [Integer]
+    default = 0
+  -M  Matrix [String]
+    default = BLOSUM62
+  -q  Penalty for a nucleotide mismatch (blastn only) [Integer]
+    default = -3
+  -r  Reward for a nucleotide match (blastn only) [Integer]
+    default = 1
+  -F  Filter query sequence (DUST with blastn, SEG with others) [String]
+    default = T
+  -e  Expectation value (E) [Real]
+    default = 10.0
+  -S  Query strands to search against database (blastn only).  3 is both, 1 is top, 2 is bottom [Integer]
+    default = 3
+  -T  Produce HTML output [T/F]
+    default = F
+  -m  Use Mega Blast for search [T/F]  Optional
+    default = F
+  -Y  Effective length of the search space (use zero for the real size) [Real]
+    default = 0
+  -t  Length of the largest intron allowed in tblastn for linking HSPs [Integer]
+    default = 0
+  -I  Location on first sequence [String]  Optional
+  -J  Location on second sequence [String]  Optional
+  -D  Output format: 0 - traditional, 1 - tabular [Integer]
+    default = 0
+  -U  Use lower case filtering for the query sequence [T/F]  Optional
+    default = F
+  -A  Input sequences in the form of accession.version [T/F]
+    default = F
+  -V  Force use of the legacy BLAST engine [T/F]  Optional
+    default = F
+
+=end
