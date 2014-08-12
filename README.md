@@ -23,7 +23,7 @@ bb.motif
 
 This program was used to generate a supplemental file for the publication:
 
-Marina Iovene, Pablo F. Cavagnaro, Douglas Senalik, C. Robin Buell, Jiming Jiang and Philipp W. Simon<br>
+Marina Iovene, Pablo F. Cavagnaro, Douglas Senalik, C. Robin Buell, Jiming Jiang and Philipp W. Simon
 Comparative FISH mapping of Daucus species (Apiaceae family)
 
 [Chromosome Research Volume 19, Number 4, 493-506](http://www.springerlink.com/content/y73j6m3133n16773/)
@@ -54,7 +54,8 @@ This was cited by
 Tongwu Zhang, Xiaowei Zhang, Songnian Hu and Jun Yu
 An efficient procedure for plant organellar genome assembly, based on whole genome data
 from the 454 GS FLX sequencing platform
-[Plant Methods 2011, 7:38  doi:10.1186/1746-4811-7-38](http://www.plantmethods.com/content/7/1/38)
+[Plant Methods 2011, 7:38](http://www.plantmethods.com/content/7/1/38) doi:10.1186/1746-4811-7-38
+[Additional file 1](http://www.plantmethods.com/content/supplementary/1746-4811-7-38-s1.doc)
 
 bb.454contignet
 ---------------
@@ -72,12 +73,27 @@ De novo assembly of the carrot mitochondrial genome using next generation sequen
 DNA provides first evidence of DNA transfer into an angiosperm plastid genome
 [BMC Plant Biology 2012, 12:61](http://www.biomedcentral.com/1471-2229/12/61)
 
-This was also cited by
+Other citations:
 
-Tongwu Zhang, Xiaowei Zhang, Songnian Hu and Jun Yu
+1. Tongwu Zhang, Xiaowei Zhang, Songnian Hu and Jun Yu
 An efficient procedure for plant organellar genome assembly, based on whole genome data
 from the 454 GS FLX sequencing platform
-[Plant Methods 2011, 7:38  doi:10.1186/1746-4811-7-38](http://www.plantmethods.com/content/7/1/38)
+[Plant Methods 2011, 7:38](http://www.plantmethods.com/content/7/1/38) doi:10.1186/1746-4811-7-38
+[Additional file 1](http://www.plantmethods.com/content/supplementary/1746-4811-7-38-s1.doc)
+
+2. Fajardo _et al._ Complete plastid genome sequence of _Vaccinium macrocarpon_: structure,
+gene content, and rearrangements revealed by next generation sequencing
+[Tree Genetics & Genomes April 2013, Volume 9, Issue 2, pp 489-498](http://link.springer.com/article/10.1007%2Fs11295-012-0573-9)
+
+3. Chang S, Wang Y, Lu J, Gai J, Li J, et al. (2013)
+The Mitochondrial Genome of Soybean Reveals Complex Genome Structures and Gene Evolution
+at Intercellular and Phylogenetic Levels. [PLoS ONE 8(2): e56502.](http://www.plosone.org/article/info%3Adoi%2F10.1371%2Fjournal.pone.0056502)
+doi:10.1371/journal.pone.0056502
+
+4. Shearman _et al._ Assembly and analysis of a male sterile rubber tree mitochondrial
+genome reveals DNA rearrangement events and a novel transcript
+[BMC Plant Biology 2014, 14:45](http://www.biomedcentral.com/1471-2229/14/45)
+doi:10.1186/1471-2229-14-45
 
 bb.454contiginfo
 ----------------
