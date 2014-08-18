@@ -103,3 +103,12 @@ Roche newbler/gsAssembler, and displays all information for one or more specifie
 in particular, the connection and read flowthrough information.
 
 For more details see http://www.vcru.wisc.edu/simonlab/sdata/software/index.html#contiginfo
+
+bb.scaftigs
+-----------
+
+This program will return all portions of a final assembly consisting of
+contiguous sequence, with sequences split at every occurrence of gaps of
+unknown bases (Ns)
+
+
