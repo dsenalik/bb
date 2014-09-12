@@ -13,6 +13,7 @@ use Getopt::Long;      # for getting command line parameters
 # version 1.0 Spetember 3, 2011
 # Version 1.1 September 3, 2011 - Add subrange feature to --seq
 #                                 Modify to work with scaffolds also
+# Version 1.2 August 21, 2014   - Add --spacer flag
 
 
 
@@ -23,6 +24,8 @@ my $version = "1.1";
 my $spacerlen = 20;
 my $defaultwrap = 100;
 my $defaultglobalprefix = "contig";
+my $defaultspacer = 100;
+my $fwdflag = '+';  # set to null string if you don't want '+' in the FASTA header
 
 
 
@@ -56,6 +59,7 @@ my @exclude     = ();   # sequences to exclude
 my $globalprefix = $defaultglobalprefix;
 my $help        = 0;    # print help and exit
 my $oneseq;             # to concatenate all sequences, and optional header
+my $spacer;             # N spacer length when using --onesequence
 my $annotate    = 0;    # extra information in header
 my $startstop   = 0;    # put start and stop coordinates in file
 my $noqual      = 0;    # do not attempt to include qual file
@@ -76,6 +80,7 @@ GetOptions (
             "sequence=s"     => \@seq,               # string array
             "exclude=s"      => \@exclude,           # string array
             "onesequence:s"  => \$oneseq,            # flag/string
+            "spacer:s"       => \$spacer,            # flag/string
             "prefix:s"       => \$globalprefix,      # flag/string
             "annotate"       => \$annotate,          # flag
             "startstop"      => \$startstop,         # flag
@@ -96,6 +101,7 @@ unless ( scalar @infilenames ) { $help = 1; }
 unless ( $outfilename ) { $help = 1; }
 if ( ( ( scalar @seq ) + ( scalar @exclude ) + $random ) < 1 ) { $help = 1; }
 if ( ( defined $wrap ) and ( $wrap == 0 ) ) { $wrap = $defaultwrap; }
+if ( $outfilename eq '-' ) { $quiet = 1; }
 # debug implies not quiet
 if ( $debug ) { $quiet = 0; }
 
@@ -148,6 +154,8 @@ Optional parameters:
   --onesequence[=xxx] concatenate all sequences into one. If a value
                     is specified, that is used as the header.
                     use --trim to inhibit supplemental info
+  --spacer[=xxx]    when using --onesequence, add a spacer of $defaultspacer N's
+                    between every sequence, or other length as specified
   --annotate        if --onesequence used, put extra information in
                     header: sequence lengths
   --startstop       add starting and ending base position
@@ -215,7 +223,7 @@ foreach my $infilename ( @infilenames )
             if ( $trim ) { $hdr =~ s/\s.*//; }
             ( $currkey = $hdr ) =~ s/\s.*$//;  # header up to first white space
             # remove internal leading zeros in key, e.g. contig00001 becomes contig1
-            $currkey =~ s/^([^\d]*)0+/$1/;
+            $currkey =~ s/^([^\d]*)0+([^0])/$1$2/;
             $inhdr{$currkey} = $hdr;  # ">" has been removed
             push ( @originalorder, $currkey );
             if ( ( scalar keys %inhdr ) <= 10 ) { debugmsg ( "Reading in sequence with key \"$currkey\", header \"$hdr\"" ); }
@@ -258,7 +266,7 @@ foreach my $infilename ( @infilenames )
                 if ( $trim ) { $hdr =~ s/\s.*//; }
                 ( $currkey = $hdr ) =~ s/\s.*$//;  # header up to first white space
                 # remove internal leading zeros in key, e.g. contig00001 becomes contig1
-                $currkey =~ s/^([^\d]*)0+/$1/;
+                $currkey =~ s/^([^\d]*)0+([^0])/$1$2/;
                 $inqhdr{$currkey} = $hdr;  # ">" has been removed
                 if ( ( scalar keys %inqhdr ) <= 10 ) { debugmsg ( "Reading in quality with key \"$currkey\", header \"$hdr\"" ); }
               }
@@ -342,8 +350,9 @@ if ( $doqual )
 ############################################################
 # --seq mode
 ############################################################
-foreach my $aseqnum ( @seq )
+for my $i ( 0 .. $#seq )
   {
+    my $aseqnum = $seq[$i];
     # save full string for --annotation
     my $ann = $aseqnum;
 
@@ -354,7 +363,7 @@ foreach my $aseqnum ( @seq )
     # strip off reverse complement flag if present
     my $rc = 0;
     if ( $aseqnum =~ m/-/ ) { $rc = 1; }
-    $aseqnum =~ s/-//g;
+    $aseqnum =~ s/[\-\+]//g;
 
     # check for special spacer
     unless ( $aseqnum =~ m/^S\d*$/i )
@@ -513,6 +522,11 @@ foreach my $aseqnum ( @seq )
 
     # print sequence to output, and follow with a return
     $outfdata .= $aseq . "\n";
+
+    # optional spacer for --onesequence mode for all but last sequence
+    if ( ( $spacer ) and ( $i < $#seq ) )
+      { $outfdata .= 'N' x $spacer . "\n"; }
+
     if ( $blankline ) { $outfdata .= "\n"; }
     $nlines += ( $aseq =~ tr/\n// + 1 );
     if ( $doqual )
@@ -523,7 +537,7 @@ foreach my $aseqnum ( @seq )
 
     if ( $annotate )
       { $aseqnum = $ann }
-  } # foreach my $aseqnum ( @seq )
+  } # for my $i ( 0 .. $#seq )
 
 
 
@@ -616,7 +630,7 @@ if ( defined $oneseq )
     else
       { $header = "concatenated"; }
     unless ( $trim )
-      { $header .= " ".scalar(@seq)." sequences: ".join ("+", @seq); }
+      { $header .= " ".scalar(@seq)." sequences: ".join (",", @seq); }
     print $OUTF ">", $header, "\n";
     if ( $doqual ) { print $OUTQ ">", $header, "\n"; }
   }
@@ -747,7 +761,7 @@ foreach my $aseq ( @unexpanded )
         if ( defined $range[2] ) { $subrange .= ":" . $range[2]; }
 
         # save reverse complement flag
-        my $revcomp = "";
+        my $revcomp = $fwdflag;
         if ( $asubseq =~ m/-/ ) { $revcomp = "-"; }
 
         # remove "-" or "+"
@@ -785,8 +799,9 @@ foreach my $aseq ( @unexpanded )
               { $prefix = $asubseq; }
             unless ( $prefix ) { $prefix = $globalprefix; }
             # trim leading zeroes
-            $number =~ s/^0+//;
+            $number =~ s/^0+([1-9])/$1/;
             my $fullid = $revcomp.$prefix.$number.$subrange;
+            debugmsg ( "Fullid = \"$fullid\"" );
             push ( @expanded, $fullid );
             if ( $index <= 10 ) { debugmsg ( "  Saving single contig \"$fullid\"" ); }
           }

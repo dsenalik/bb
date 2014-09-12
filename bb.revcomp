@@ -1,0 +1,29 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+
+=bb
+pipe to reverse complement a stream
+=cut bb
+
+
+
+my @stream = <>;
+my $rc = revcomp ( join ( '', @stream ) );
+print $rc;
+exit 0;
+
+
+
+############################################################
+sub revcomp { my ( $dna ) = @_;
+############################################################
+# standard DNA reverse complement, including degenerate bases
+  my $revcomp = reverse ( $dna );
+  $revcomp =~ tr/AaCcTtGgMmRrYyKkVvHhDdBb/TtGgAaCcKkYyRrMmBbDdHhVv/;
+  return $revcomp;
+} # sub revcomp
+
+
+
+#eof

@@ -1,0 +1,509 @@
+#!/usr/bin/perl
+#----------------------------------------------------------#
+#        Author: Douglas Senalik dsenalik@wisc.edu         #
+#----------------------------------------------------------#
+# "Black Box" program series
+=bb
+Search and return sequences from FASTA or FASTQ files based on matches
+to one or more queries to text in the header line. Also can do search
+and replace on headers.
+=cut bb
+use strict;
+use warnings;
+use Getopt::Long;      # for getting command line parameters
+
+
+
+############################################################
+# configuration variables
+############################################################
+my $defaultgrepcolumn = 1;
+my $grepfiledelimiter = "\t";
+
+
+
+############################################################
+# global variables
+############################################################
+my $ansiup    = "\033[1A";  # terminal control
+(my $prognopath = $0) =~ s/^.*[\/\\]//;
+my @hits = ();  # number of hits for each grep term
+my @newnamelist;
+
+
+
+############################################################
+# command line parameters
+############################################################
+my $infilename  = "";   # input file name
+my $outfilename = "";   # output file name
+my @grep        = ();   # search string
+my $grepfile    = "";
+my $greptrim;
+my $grepcolumn  = $defaultgrepcolumn;
+my $returncount = 0;    # program return code is number of hits
+my $trim        = 0;    # trim all FASTA header after first white space
+my $fastq       = 0;
+my $invert      = 0;
+my $append      = 0;
+my $raw         = 0;    # no FASTA headers
+my $revcomp     = 0;    # reverse complement
+my @replace;
+my @with;
+my $rwfile;
+my $newnames;
+my $warn;
+my $help        = 0;    # print help and exit
+my $quiet       = 0;    # only show errors
+my $debug       = 0;    # print extra debugging information
+GetOptions (
+            "infile=s"       => \$infilename,        # string
+            "outfile=s"      => \$outfilename,       # string
+            "grep=s"         => \@grep,              # string array
+            "grepfile=s"     => \$grepfile,          # string
+            "greptrim"       => \$greptrim,          # flag
+            "grepcolumn=i"   => \$grepcolumn,        # integer
+            "returncount"    => \$returncount,       # flag
+            "trim"           => \$trim,              # flag
+            "fastq"          => \$fastq,             # flag
+            "v"              => \$invert,            # flag
+            "raw"            => \$raw,               # flag
+            "revcomp|rc"     => \$revcomp,           # flag
+            "append"         => \$append,            # flag
+            "replace=s"      => \@replace,           # string array
+            "with=s"         => \@with,              # string array
+            "rwfile=s"       => \$rwfile,            # string
+            "newnames=s"     => \$newnames,          # string
+            "warn"           => \$warn,              # flag
+            "help"           => \$help,              # flag
+            "quiet"          => \$quiet,             # flag
+            "debug"          => \$debug);            # flag
+# debug implies not quiet
+if ( $debug ) { $quiet = 0; }
+if ( ( $outfilename ) and ( $outfilename eq "-" ) ) { $quiet = 1; }
+unless ( ( $infilename ) and ( $outfilename ) and ( ( scalar @grep ) or ( $grepfile ) ) ) { $help = 1; }
+foreach my $agrep ( @grep )
+  {
+    if ( $agrep =~ m/^>/ )
+      {
+        print "Don't start your search string with \">\", this is stripped out\n";
+        $help = 1;
+      }
+  }
+# make sure we have as many elements in @with as we have in @replace
+while ( ( scalar @replace ) > ( scalar @with ) )
+  { push ( @with, "" ); }
+
+
+
+############################################################
+# print help screen
+############################################################
+if ( $help )
+  {
+    print "$prognopath
+Search and return sequences from FASTA or FASTQ files based on matches
+to one or more queries to text in the header line. Also can do search
+and replace on headers.
+
+Required parameters:
+  --infile=xxx      input file name, gzipped with \".gz\" extension ok
+  --outfile=xxx     output file name, \"-\" for stdout
+  --grep=xxx        search parameters (multiple allowed)
+  or
+  --grepfile=xxx    search parameters in a text file, one per line
+Optional parameters:
+  --fastq           input file is in FASTQ format instead of FASTA
+  --grepcolumn      if using --grepfile, look in this column, first
+                    column=1, default=$defaultgrepcolumn
+  --greptrim        if using --grepfile, left and right trim white
+                    space off of the grep expression
+  --returncount     program error code will be number of
+                    sequences returned, otherwise it is 0 for success
+  --trim            trim all FASTA/Q header after the first white space
+  --v               invert the search, only return non-hits (like grep -v)
+  --append          append results to existing --outfile
+  --raw             do not return headers, only sequence is output
+  --revcomp|rc      reverse complement the returned sequence (FASTA only)
+  --replace=xxx     search and replace in headers, multiple allowed
+  --with=xxx        replacement string(s), if undefined then deletes
+                    if --grep=. then you can replace in all sequences
+  --rwfile=xxx      a text file to supply multiple --replace --with
+                    pairs, one per line, separated by tab
+  --newnames=xxx    file with new fasta headers in same order as output
+                    file, to completely replace existing fasta headers.
+                    if first line starts with \">\" then can be a FASTA file
+                    otherwise one header per line.
+                    This does not work for FASTQ files.
+  --warn            Return names of grep strings with zero or > 1 hit
+  --help            print this screen
+  --quiet           only print error messages
+  --debug           print extra debugging information
+";
+    exit 1;
+  } # if ( $help )
+
+
+
+############################################################
+# grep file parsing
+############################################################
+if ( $grepfile )
+  {
+    my $INF = stdopen ( "<", $grepfile, "grep" );
+    while ( my $aline = <$INF> )
+      {
+        $aline =~ s/[\r\n]//g;
+        my @cols = split ( /$grepfiledelimiter/, $aline );
+        next unless ( defined $cols[$grepcolumn-1] );
+        if ( $greptrim )
+          {
+            $cols[$grepcolumn-1] =~ s/^\s+//;  # left trim
+            $cols[$grepcolumn-1] =~ s/\s+$//;  # right trim
+          }
+        push ( @grep, $cols[$grepcolumn-1] );
+      } # while
+    stdclose ( $INF );
+  } # if ( $grepfile )
+
+
+
+############################################################
+# rwfile parsing
+############################################################
+if ( $rwfile )
+  {
+    my $INF = stdopen ( "<", $rwfile, "--rwfile" );
+    my $nlines = 0;
+    while ( my $aline = <$INF> )
+      {
+        $nlines++;
+        $aline =~ s/[\r\n]//g;
+        next unless ( length($aline) );
+        my @cols = split ( /$grepfiledelimiter/, $aline );
+        push ( @replace, $cols[0] );
+        push ( @with, $cols[1] );  # can be undefined
+      } # while
+    stdclose ( $INF );
+  } # if ( $rwfile )
+
+
+
+############################################################
+# rwfile parsing
+############################################################
+if ( $newnames )
+  {
+    my $INF = stdopen ( "<", $newnames, "--newnames" );
+    my $nlines = 0;
+    my $fastamode = 0;
+    while ( my $aline = <$INF> )
+      {
+        $nlines++;
+        $aline =~ s/[\r\n]//g;
+        if ( ( $nlines == 1 ) and ( $aline =~ m/^>/ ) ) { $fastamode = 1; }
+        next if ( ( $fastamode ) and ( $aline !~ m/^>/ ) );
+        if ( $fastamode ) { $aline =~ s/^>//; }
+        push ( @newnamelist, $aline );
+      } # while
+    stdclose ( $INF );
+    unless ( $quiet ) { print "Loaded ".commify(scalar @newnamelist)." --newnames\n"; }
+  } # if ( $newnames )
+
+
+
+############################################################
+# initialize for main loop
+############################################################
+my $keep = 0;
+my $totalseq = 0;
+my $savedseq = 0;
+my $fhinfile = stdopen ( "<", $infilename, "input " );
+my $fhoutfile = stdopen ( ($append?">>":">"), $outfilename, "output " );
+if ( $debug )
+  {
+    foreach my $agrep ( @grep )
+      { debugmsg ( "grep expression is \"$agrep\""); }
+  }
+
+
+
+############################################################
+# main loop - FASTA
+############################################################
+unless ( $fastq )
+  {
+    my $seqbuffer = "";
+    while ( my $aline = <$fhinfile> )
+      {
+        $aline =~ s/[\r\n]//g;
+        my $header = "";
+        if ( $aline =~ m/^>(.*)$/ )
+          {
+            $header = $1;
+
+            # print prior sequence
+            fastaout ( $fhoutfile, $seqbuffer );
+            $seqbuffer = "";
+
+            $keep = 0;
+            $totalseq++;
+            for my $i ( 0..$#grep )
+              {
+                if ( $header =~ m/$grep[$i]/i )
+                  {
+                    $keep = 1;
+                    debugmsg ( "Header \"$header\" matched grep \"$grep[$i]\"" );
+                    $hits[$i]++;
+                    last;
+                  } # if grep matches
+              } # foreach @grep
+            if ( $trim )
+              { $aline =~ s/\s.*$//; }
+            if ( $invert ) { $keep = ! $keep; }
+            if ( $keep )
+              {
+                if ( $newnamelist[$savedseq] ) { $header = $newnamelist[$savedseq]; }
+                $header = sar ( $header );  # sar=search and replace
+                $savedseq++;
+                # print header line to output file
+                unless ( $raw ) { print $fhoutfile ">", $header, "\n"; }
+              }
+          } # if header line
+        else
+          {
+            if ( $keep ) { $seqbuffer .= $aline . "\n"; }
+          }
+      } # while <$fhinfile>
+    fastaout ( $fhoutfile, $seqbuffer );
+  } # not $fastq
+else  # $fastq
+
+
+
+############################################################
+# main loop - FASTQ
+############################################################
+  {
+    my $subline = 3;
+    open ( my $fhinfile, "<", $infilename ) or die ( "Error opening input file \"$infilename\": $!\n" );
+    open ( my $fhoutfile, ">", $outfilename ) or die ( "Error opening output file \"$outfilename\": $!\n" );
+    while ( my $aline = <$fhinfile> )
+      {
+        $aline =~ s/[\r\n]//g;
+        $subline = ( ( $subline + 1 ) % 4 );
+        if ( $subline == 0 )
+          {
+            unless ( $aline =~ m/^\@(.*)$/ )
+              { die "Error, invalid format for line \"$aline\", does not start with \"@\"\n"; }
+            my $header = $1;
+            $keep = 0;
+            $totalseq++;
+            for my $i ( 0..$#grep )
+              {
+                if ( $header =~ m/$grep[$i]/i )
+                  {
+                    $keep = 1;
+                    $savedseq++;
+                    debugmsg ( "Header \"$header\" matched grep \"$grep[$i]\"" );
+                    $hits[$i]++;
+                    $aline = sar ( $aline );
+                    last;
+                  } # if grep matches
+              } # foreach @grep
+            if ( $trim )
+              { $aline =~ s/\s.*$//; }
+          } # if header line
+        if ( $invert ) { $keep = ! $keep; }
+        if ( ( $keep ) and ! ( $raw and ( $subline != 1 ) ) )
+          { print $fhoutfile $aline, "\n"; }
+    
+      } # while <$fhinfile>
+  } # else $fastq
+    
+    
+    
+############################################################
+# termainate main loop
+############################################################
+stdclose ( $fhoutfile );
+stdclose ( $fhinfile );
+    
+
+
+# hit count statistics
+my @stats = ();
+for my $i ( 0..$#hits )
+  {
+    my $ahit = ( $hits[$i] // 0 );
+    if ( ( $warn ) and ( ( $ahit == 0 ) or ( $ahit > 1 ) ) )
+      { print "grep #$i \"$grep[$i]\" had $ahit hits\n"; }
+    $stats[$ahit]++;
+  }
+
+unless ( $quiet )
+  {
+    print "Input file contained ", commify($totalseq), " sequences\n";
+    print commify($savedseq), " sequences were saved to output file\n";
+    print "Number   Number of\n";
+    print "Matched  Grep expressions\n";
+    for my $i ( 0..$#stats )
+      { 
+        if ( defined $stats[$i] )
+          { printf ( "%6d %8d\n", $i, $stats[$i] ); }
+      }
+  }
+
+
+
+if ( $returncount )
+  { exit $savedseq; }
+else
+  { exit 0; }
+
+
+
+############################################################
+sub sar { my ( $text ) = @_;
+############################################################
+# Search And Replace
+  if ( @replace )
+    {
+      for my $i ( 0..$#replace )
+        { $text =~ s/$replace[$i]/$with[$i]/g; }
+    }
+  return $text;
+} # sub sar
+
+
+
+############################################################
+sub fastaout { my ( $fh, $seq ) = @_;
+############################################################
+# if $seq contains anything, print it to the output file handle
+  if ( $seq )
+    {
+      if ( $revcomp )
+        {
+          $seq =~ s/\n+$//;
+          $seq = revcomp($seq);
+          $seq .= "\n";
+        }
+      print $fh $seq;
+    }
+} # sub fastaout
+
+
+
+############################################################
+sub debugmsg { my ( $text, $noreturn, $nolinenum ) = @_;
+############################################################
+  if ( $debug )
+    {
+      my ($package, $filename, $line, $sub) = caller(0);
+      unless ( $nolinenum ) { $text = "Line $line: " . $text; }
+      if ( ! ( $noreturn ) ) { $text .= "\n"; }
+      print $text;
+    } # if ( $debug )
+} # sub debugmsg
+
+
+
+###############################################################
+sub timestr {
+###############################################################
+  @_ = localtime(shift || time);
+  return(sprintf("%04d/%02d/%02d %02d:%02d", $_[5]+1900, $_[4]+1, $_[3], @_[2,1]));
+} # sub timestr
+
+
+
+###############################################################
+sub commify {
+###############################################################
+# http://perldoc.perl.org/perlfaq5.html#How-can-I-output-my-numbers-with-commas
+  local $_ = shift;
+  1 while s/^([-+]?\d+)(\d{3})/$1,$2/;
+  return $_;
+} # commify
+
+
+
+###############################################################
+sub stdopen { my ( $mode, $filename, $extratext ) = @_;
+###############################################################
+# a replacement for the three-parameter open which also allows
+# the use of "-" as the file name to mean STDIN or STDOUT
+  my $fh;  # the file handle
+  if ( $filename eq "-" )  # only exact match to "-" has special meaning
+    {
+      if ( $mode =~ m/>/ )
+        { $fh = *STDOUT }
+      else
+        { $fh = *STDIN }
+    }
+  else
+    {
+      # supplemental passed text for error messages, need one more space
+      if ( defined $extratext )
+        { $extratext .= " " }
+      else
+        { $extratext = "" }
+
+      my $text;  # this is only used for error message
+      if ( $mode =~ m/^\+?>>/ )  # ">>" or "+>>"
+        { $text = "append" }
+      elsif ( $mode =~ m/^\+?>/ )  # ">" or "+>"
+        { $text = "output" }
+      elsif ( $mode =~ m/^\+?</ )  # "<" or "+<"
+        { $text = "input" }
+      elsif ( $mode eq "-|" )
+        { $text = "piped input" }
+      elsif ( $mode eq "|-" )
+        { $text = "piped output" }
+      else
+        { die "Error, unsupported file mode \"$mode\" specified to stdopen( $mode, $filename, $extratext )\n"; }
+
+      # if file name ends in ".gz", gzip compression is assumed, and handle it transparently
+      if ( $filename =~ m/\.gz$/ )
+        {
+          if ( $mode =~ m/^>$/ ) # output mode
+            { $mode = "|-"; $filename = "gzip -c > \"$filename\""; }
+          elsif ( $mode =~ m/^<$/ ) # input mode
+            { $mode = "-|"; $filename = "gunzip -c \"$filename\""; }
+          else
+            { die "Error, can't handle gzip compression with mode \"$mode\" for file \"filename\"\n"; }
+        } # if gzip compressed file
+      open ( $fh, $mode, $filename ) or die ( "Error opening ${extratext}file \"$filename\" for $text: $!\n" );
+    }
+  # return the opened file handle to the caller
+  return $fh;
+} # stdopen
+
+
+
+###############################################################
+sub stdclose { my ( $fh ) = @_;
+###############################################################
+# same as built-in close, except in case of STDIN or STDOUT,
+# and in this case the file handle is not closed
+
+  unless ( fileno($fh) <= 2 )  # if file number is this low, is stdin or stdout or stderr
+    { close ( $fh ) or die ( "Error closing file handle: $!\n" ); }
+
+} # sub stdclose
+
+
+
+############################################################
+sub revcomp { my ( $dna ) = @_;
+############################################################
+# standard DNA reverse complement, including degenerate bases
+  my $revcomp = reverse ( $dna );
+  $revcomp =~ tr/AaCcTtGgMmRrYyKkVvHhDdBb/TtGgAaCcKkYyRrMmBbDdHhVv/;
+  return $revcomp;
+} # sub revcomp
+
+
+
+# eof
