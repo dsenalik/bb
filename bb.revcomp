@@ -1,9 +1,12 @@
 #!/usr/bin/perl
 use strict;
 use warnings;
-
+#----------------------------------------------------------#
+#        Author: Douglas Senalik dsenalik@wisc.edu         #
+#----------------------------------------------------------#
+# "Black Box" program series
 =bb
-pipe to reverse complement a stream
+pipe to reverse complement a raw sequence stream
 =cut bb
 
 

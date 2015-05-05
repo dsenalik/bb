@@ -1,0 +1,215 @@
+#!/usr/bin/perl
+#----------------------------------------------------------#
+#        Author: Douglas Senalik dsenalik@wisc.edu         #
+#----------------------------------------------------------#
+# "Black Box" program series
+=bb
+A pipe which will insert time stamps into the passing data
+=cut bb
+use strict;
+use warnings;
+use Getopt::Long;      # for getting command line parameters
+
+
+
+############################################################
+# configuration variables
+############################################################
+my $defaultinterval = 5;  # time in minutes
+
+
+
+############################################################
+# global variables
+############################################################
+my $ansiup    = "\033[1A";  # terminal control
+(my $prognopath = $0) =~ s/^.*[\/\\]//;
+
+
+
+############################################################
+# command line parameters
+############################################################
+my $interval     = $defaultinterval;
+my $prefix       = "";
+my $suffix       = "";
+my $noreturn     = 0;
+my $help         = 0;    # print help and exit
+my $quiet        = 0;    # only show errors
+my $debug        = 0;    # print extra debugging information
+GetOptions (
+            "interval=s"     => \$interval,          # string
+            "prefix=s"       => \$prefix,            # string
+            "suffix=s"       => \$suffix,            # string
+            "noreturn"       => \$noreturn,          # flag
+            "help"           => \$help,              # flag
+            "quiet"          => \$quiet,             # flag
+            "debug"          => \$debug);            # flag
+# debug implies not quiet
+if ( $debug ) { $quiet = 0; }
+# convert interval from minutes to seconds
+unless ( $interval )
+   { $help = 1; }
+else
+   { $interval = ( $interval * 60 ); }
+debugmsg ( "Interval in seconds = \"$interval\"" );
+
+
+
+############################################################
+# print help screen
+############################################################
+if ( $help )
+  {
+    print "$prognopath
+This program acts as a pipe, and will insert time stamps
+in the stream
+Optional parameters:
+  --interval=xxx    minutes between time stamps, default=$defaultinterval
+  --prefix=xxx      put this text in front of time, default=nothing
+  --suffix=xxx      put this text in after time, default=nothing
+  --noreturn        do not put a return after time
+  --help            print this screen
+  --debug           print extra debugging information
+";
+#  --quiet           only print error messages
+    exit 1;
+  } # if ( $help )
+
+
+
+############################################################
+# main loop
+############################################################
+my $starttime = time();
+my $laststamp = 0;
+my $INF = stdopen ( "<", "-" );
+my $OUTF = stdopen ( ">", "-" );
+binmode ( $INF );  # not sure if necessary, but shouldn't hurt
+select($INF); $| = 1;   # input unbuffered
+select($OUTF); $| = 1;  # output unbuffered
+while ( ! eof($INF) )
+  {
+    # print out timestamp at desired interval. If interval not yet reached,
+    # then does nothing
+    my $currtime = time();
+    if ( ( $currtime - $laststamp ) > $interval )
+      {
+        # remove time in $interval increments so we don't accumulate weird intervals
+        if ( $laststamp <= 0 )
+          { $laststamp = $currtime }
+        else
+          {
+            while ( ( $currtime - $laststamp ) > $interval )
+              { $laststamp += $interval; }
+          }
+        print $OUTF $prefix, timestr($currtime), $suffix;
+        unless ( $noreturn ) { print $OUTF "\n"; }
+      }
+
+    # read in a chunk of unbuffered input data. Will block here waiting for input
+    # unless piping program terminates, then will return 0 bytes read
+    my $buf;
+    my $nread = sysread($INF, $buf, 1024);
+    debugmsg ( "Read $nread bytes from input stream" );
+    if ( $nread <= 0 )
+      {
+        debugmsg ( "\$nread=$nread is <= 0, ending" );
+        last;
+      }
+    print $OUTF $buf;
+
+  } # ( ! eof($INF) )
+debugmsg ( "Closing file handles" );
+stdclose ( $OUTF );
+stdclose ( $INF );
+exit 0;
+
+
+
+############################################################
+sub debugmsg { my ( $text, $noreturn, $nolinenum ) = @_;
+############################################################
+  if ( $debug )
+    {
+      my ($package, $filename, $line, $sub) = caller(0);
+      unless ( $nolinenum ) { $text = "Line $line: " . $text; }
+      if ( ! ( $noreturn ) ) { $text .= "\n"; }
+      print $text;
+    } # if ( $debug )
+} # sub debugmsg
+
+
+
+###############################################################
+sub timestr {
+###############################################################
+  @_ = localtime(shift || time);
+  return(sprintf("%04d/%02d/%02d %02d:%02d:%02d", $_[5]+1900, $_[4]+1, $_[3], @_[2,1,0]));
+} # sub timestr
+
+
+
+###############################################################
+sub commify {
+###############################################################
+# http://perldoc.perl.org/perlfaq5.html#How-can-I-output-my-numbers-with-commas
+  local $_ = shift;
+  1 while s/^([-+]?\d+)(\d{3})/$1,$2/;
+  return $_;
+} # commify
+
+
+
+###############################################################
+sub stdopen { my ( $mode, $filename, $extratext ) = @_;
+###############################################################
+# a replacement for the three-parameter open which also allows
+# the use of "-" as the file name to mean STDIN or STDOUT
+  my $fh;  # the file handle
+  if ( $filename eq "-" )  # only exact match to "-" has special meaning
+    {
+      if ( $mode =~ m/>/ )
+        { $fh = *STDOUT }
+      else
+        { $fh = *STDIN }
+    }
+  else
+    {
+      # supplemental passed text for error messages, need one more space
+      if ( defined $extratext )
+        { $extratext .= " " }
+      else
+        { $extratext = "" }
+
+      my $text;  # this is only used for error message
+      if ( $mode =~ m/^\+?>>/ )  # ">>" or "+>>"
+        { $text = "append" }
+      elsif ( $mode =~ m/^\+?>/ )  # ">" or "+>"
+        { $text = "output" }
+      elsif ( $mode =~ m/^\+?</ )  # "<" or "+<"
+        { $text = "input" }
+      else
+        { die "Error, unsupported file mode \"$mode\" specified to stdopen( $mode, $filename, $extratext )\n"; }
+      open ( $fh, $mode, $filename ) or die ( "Error opening ${extratext}file \"$filename\" for $text: $!\n" );
+    }
+  # return the opened file handle to the caller
+  return $fh;
+} # stdopen
+
+
+
+###############################################################
+sub stdclose { my ( $fh ) = @_;
+###############################################################
+# same as built-in close, except in case of STDIN or STDOUT,
+# and in this case the file handle is not closed
+
+  unless ( fileno($fh) <= 2 )  # if file number is this low, is stdin or stdout or stderr
+    { close ( $fh ) or die ( "Error closing file handle: $!\n" ); }
+
+} # sub stdclose
+
+
+
+# eof

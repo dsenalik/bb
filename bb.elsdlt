@@ -1,0 +1,333 @@
+#!/usr/bin/perl
+#----------------------------------------------------------#
+#        Author: Douglas Senalik dsenalik@wisc.edu         #
+#----------------------------------------------------------#
+# "Black Box" program series
+=bb
+This program parses output from a Shimadzu ELSD-LT RS232 serial port
+=cut bb
+use strict;
+use warnings;
+use Getopt::Long;
+use Device::SerialPort;
+use IO::Handle;
+
+
+
+############################################################
+# configuration variables
+############################################################
+my $psiperkpa = 0.145037738;
+
+# serial settings are fixed values here and not parameters
+# because they are hard to change on the ELSD, so always use defaults
+my $baud = 9600;
+my $parity = 'none';
+my $databits = 8;
+my $stopbits = 1;
+my $readconsttime = 500;  # const time for read (milliseconds) ELSD will need ~0.25 second
+my $readchartime = 5;  # avg time between read char
+
+
+
+############################################################
+# global variables
+############################################################
+my $ansiup    = "\033[1A";  # terminal control
+(my $prognopath = $0) =~ s/^.*[\/\\]//;
+my $kpascale = 1;
+my $serial;  # input serial port handle
+my $OUTF;  # output file handle
+
+
+
+############################################################
+# command line parameters
+############################################################
+my $portname;            # serial port device
+my $outfilename;         # output file name, use \"-\" for stdout
+my $noheader     = 0;    # inhibit header line in output
+my $append       = 0;    # append to existing output file
+my $psi;                 # scale pressure from kPa to psi
+my $help         = 0;    # print help and exit
+my $quiet        = 0;    # only show errors
+my $debug        = 0;    # print extra debugging information
+GetOptions (
+            "port=s"         => \$portname,          # string
+            "outfile=s"      => \$outfilename,       # string
+            "noheader"       => \$noheader,          # flag
+            "append"         => \$append,            # flag
+            "psi"            => \$psi,               # flag
+            "help"           => \$help,              # flag
+            "quiet"          => \$quiet,             # flag
+            "debug"          => \$debug);            # flag
+# debug implies not quiet
+if ( $debug ) { $quiet = 0; }
+unless ( $portname ) { $help = 1 }
+unless ( $outfilename ) { $help = 1 }
+if ( ( $outfilename // '' ) eq "-" ) { $quiet = 1 }
+if ( $psi ) { $kpascale = $psiperkpa; }
+
+
+
+############################################################
+# print help screen
+############################################################
+if ( $help )
+  {
+    print "$prognopath
+This program collects and parses output from a Shimadzu ELSD-LT, which is
+an Evaporative Light-scattering Detector, Low Temperature,
+(original version circa 2002+) as collected from its RS232 serial port
+
+Required parameters:
+  --port=xxx        RS232 serial port, e.g. /dev/ttyS0 or /dev/ttyUSB0
+  --outfile=xxx     output file name, use \"-\" for stdout
+Optional parameters:
+  --noheader        inhibit header line in output file
+  --append          if --outfile exists, append to it rather
+                    than overwrite. --noheader is automatically
+                    applied if file exists and is not empty
+  --psi             convert kPa to psi by mulitplying by $psiperkpa
+  --help            print this screen
+  --quiet           inhibit warning messages
+  --debug           print extra debugging information
+";
+    exit 1;
+  } # if ( $help )
+
+
+
+############################################################
+# initialization
+############################################################
+{
+debugmsg ( "Initializing serial port to baud=$baud parity=$parity databits=$databits stopbits=$stopbits" );
+# open and configure the serial port, $serial is global
+$serial = new Device::SerialPort ( $portname ) or die "Error, could not open port \"$portname\": $!\n";
+$serial->baudrate($baud);
+$serial->parity($parity);
+$serial->databits($databits);
+$serial->stopbits($stopbits);
+$serial->read_const_time($readconsttime);
+$serial->read_char_time($readchartime);
+
+# initialize output file, $OUTF is global
+my $mode = '>';
+if ( $append )
+  {
+    $mode = '>>';
+    if ( -s $outfilename ) { $noheader = 1; }
+  }
+debugmsg ( "Opening output file \"$outfilename\" mode \"$mode\"" );
+$OUTF = stdopen ( $mode, $outfilename );
+$OUTF->autoflush(1);  # disable buffering
+unless ( $noheader )
+  { print $OUTF join ( "\t", "Time", "Gain", "Temperature C", "Pressure ".($psi?'psi':'kPa') ), "\n"; }
+}
+
+
+
+############################################################
+# main processing loop
+############################################################
+debugmsg ( "Entering main processing loop" );
+my $serialchars = 0;
+my $serialbuffer = '';
+while ( 1 )
+  {
+    # read up to 255 chars, ELSD record is never larger than this
+    my ( $readcount, $readdata ) = $serial->read(255);
+    if ( $readcount > 0 )
+      {
+        $serialchars += $readcount;
+        $serialbuffer .= $readdata;
+        # Check here to see if what we want is in the $buffer, and if not, wait some more
+        debugmsg ( "Received $serialchars characters \"$serialbuffer\"" );
+        if ( $serialbuffer =~ m/Pressure/ )  # the last line of a record
+          {
+            parsedata ( $serialbuffer, $OUTF );
+            $serialbuffer = '';
+            $serialchars = 0;
+          }
+      }
+    sleep ( 10 );  # ELSD sends infrequently so a long sleep is okay
+  } # infinite loop
+
+
+
+############################################################
+# due to infinite loop, we will never reach this point
+############################################################
+exit 0;
+
+
+
+############################################################
+sub parsedata { my ( $buffer, $OUTF ) = @_;
+############################################################
+  debugmsg ( "Parsing data" );
+  my $temp = 'MISSING';
+  my $gain = 'MISSING';
+  my $pressure;
+  foreach my $aline ( split ( /[\r\n]/, $buffer ) )
+    {
+      next if ( $aline =~ m/^\s*$/ ); # skip blank lines
+      # output will look like this, blank lines removed
+      #ELSD-LT PARAMETERS
+      #2015/04/14 17:13:40
+      #Date               :01/01/32
+      #Time               :09:03
+      #Temperature (dg C) :   39
+      #Gain               :    2
+      #Pressure (KPa)     :348
+      
+      # the line can sometimes contain garbage binary characters if the ELSD is
+      # turned off and back on, so don't match for start or end of line on tests
+      if ( $aline =~ m/ELSD-LT PARAMETERS/ )
+        {  }
+      elsif ( $aline =~ m|Date\s+:\s*(.*)$| )
+        {  }
+      elsif ( $aline =~ m|Time\s+:\s*(.*)$| )
+        {  }
+      elsif ( $aline =~ m|Temperature \(dg C\)\s+:\s*(.*)$| )
+        { $temp = $1; }
+      elsif ( $aline =~ m|Gain\s+:\s*(.*)$| )
+        { $gain = $1; }
+      elsif ( $aline =~ m|Pressure \(KPa\)\s+:\s*(.*)$| )
+        { $pressure = ( $1 * $kpascale ); }
+      else
+        {
+          unless ( $quiet ) { print ( "Unrecognized line \"$aline\"\n" ); }
+        }
+    } # foreach $aline
+  if ( defined $pressure )
+    {
+      # since output is unbuffered, write whole record as one entity
+      my $record = join ( "\t",
+                          timestr(),
+                          ( $gain // 'MISSING' ),
+                          ( $temp // 'MISSING' ),
+                          $pressure
+                        )."\n";
+      debugmsg ( "Saving record \"$record\"" );
+      print $OUTF $record;
+    }
+  else
+    {
+      unless ( $quiet ) { print ( "incomplete record received, ".(length($buffer))." bytes\n" ); }
+    }
+} # sub parsedata
+
+
+
+############################################################
+sub debugmsg { my ( $text, $noreturn, $nolinenum ) = @_;
+############################################################
+  if ( $debug )
+    {
+      my ($package, $filename, $line, $sub) = caller(0);
+      unless ( $nolinenum ) { $text = "Line $line: " . $text; }
+      if ( ! ( $noreturn ) ) { $text .= "\n"; }
+      print $text;
+    } # if ( $debug )
+} # sub debugmsg
+
+
+
+###############################################################
+sub timestr {
+###############################################################
+  @_ = localtime(shift || time);
+  return(sprintf("%04d/%02d/%02d %02d:%02d:%02d", $_[5]+1900, $_[4]+1, $_[3], @_[2,1,0]));
+} # sub timestr
+
+
+
+###############################################################
+sub commify {
+###############################################################
+# http://perldoc.perl.org/perlfaq5.html#How-can-I-output-my-numbers-with-commas
+  local $_ = shift;
+  1 while s/^([-+]?\d+)(\d{3})/$1,$2/;
+  return $_;
+} # commify
+
+
+
+###############################################################
+sub stdopen { my ( $mode, $filename, $extratext ) = @_;
+###############################################################
+# a replacement for the three-parameter open which also allows
+# the use of "-" as the file name to mean STDIN or STDOUT
+  my $fh;  # the file handle
+  if ( $filename eq "-" )  # only exact match to "-" has special meaning
+    {
+      if ( $mode =~ m/>/ )
+        { $fh = *STDOUT }
+      else
+        { $fh = *STDIN }
+    }
+  else
+    {
+      # supplemental passed text for error messages, need one more space
+      if ( defined $extratext )
+        { $extratext .= " " }
+      else
+        { $extratext = "" }
+
+      my $text;  # this is only used for error message
+      if ( $mode =~ m/^\+?>>/ )  # ">>" or "+>>"
+        { $text = "append" }
+      elsif ( $mode =~ m/^\+?>/ )  # ">" or "+>"
+        { $text = "output" }
+      elsif ( $mode =~ m/^\+?</ )  # "<" or "+<"
+        { $text = "input" }
+      elsif ( $mode eq "-|" )
+        { $text = "piped input" }
+      elsif ( $mode eq "|-" )
+        { $text = "piped output" }
+      else
+        { die "Error, unsupported file mode \"$mode\" specified to stdopen( $mode, $filename, $extratext )\n"; }
+
+      # if file name ends in ".gz", gzip compression is assumed, and handle it transparently
+      if ( $filename =~ m/\.gz$/ )
+        {
+          if ( $mode =~ m/^>$/ ) # output mode
+            { $mode = "|-"; $filename = "gzip -c > \"$filename\""; }
+          elsif ( $mode =~ m/^<$/ ) # input mode
+            { $mode = "-|"; $filename = "gunzip -c \"$filename\""; }
+          else
+            { die "Error, can't handle gzip compression with mode \"$mode\" for file \"filename\"\n"; }
+        } # if gzip compressed file
+      elsif ( $filename	=~ m/\.bz2$/ )
+       	{
+          if ( $mode =~ m/^>$/ ) # output mode
+            { $mode = "|-"; $filename = "bzip2 -c > \"$filename\""; }
+          elsif ( $mode =~ m/^<$/ ) # input mode
+            { $mode = "-|"; $filename = "bunzip2 -c \"$filename\""; }
+          else
+            { die "Error, can't handle bzip2 compression with mode \"$mode\" for file \"filename\"\n"; }
+       	}
+      open ( $fh, $mode, $filename ) or die ( "Error opening ${extratext}file \"$filename\" for $text: $!\n" );
+    }
+  # return the opened file handle to the caller
+  return $fh;
+} # sub stdopen
+
+
+
+###############################################################
+sub stdclose { my ( $fh ) = @_;
+###############################################################
+# same as built-in close, except in case of STDIN or STDOUT,
+# and in this case the file handle is not closed
+
+  unless ( fileno($fh) <= 2 )  # if file number is this low, is stdin or stdout or stderr
+    { close ( $fh ) or die ( "Error closing file handle: $!\n" ); }
+
+} # sub stdclose
+
+
+
+# eof
