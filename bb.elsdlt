@@ -26,7 +26,8 @@ my $parity = 'none';
 my $databits = 8;
 my $stopbits = 1;
 my $readconsttime = 500;  # const time for read (milliseconds) ELSD will need ~0.25 second
-my $readchartime = 5;  # avg time between read char
+my $readchartime = 3;  # avg time between read char
+my $touchcontent = 1;  # maybe could be a parameter, if true put last reading in --touch file
 
 
 
@@ -85,13 +86,17 @@ an Evaporative Light-scattering Detector, Low Temperature,
 Required parameters:
   --port=xxx        RS232 serial port, e.g. /dev/ttyS0 or /dev/ttyUSB0
   --outfile=xxx     output file name, use \"-\" for stdout
+                    output format is tab-delimited with four columns:
+                         date+time           gain  temperature  pressure
+                    e.g. 2015/05/06 00:22:40	2	39	350
 Optional parameters:
   --noheader        inhibit header line in output file
   --append          if --outfile exists, append to it rather
                     than overwrite. --noheader is automatically
                     applied if file exists and is not empty
   --psi             convert kPa to psi by mulitplying by $psiperkpa
-  --touch=xxx       touch this file every time some data is received
+  --touch=xxx       touch this file every time some data is received,
+                    file content will be the most recent reading
   --help            print this screen
   --quiet           inhibit warning messages
   --debug           print extra debugging information
@@ -153,8 +158,13 @@ while ( 1 )
             $serialbuffer = '';
             $serialchars = 0;
           }
+        else  # either we read in the middle of a transmission, or
+              # we received noise from turning ELSD on or off
+          { debugmsg ( "serial buffer missing \"Pressure\" with ".length($serialbuffer)." characters received" ); }
       }
-    sleep ( 10 );  # ELSD sends infrequently so a long sleep is okay
+    # ELSD sends infrequently so a long sleep is okay, however, this affects
+    # the precision of the timestamp
+    sleep ( 10 );
   } # infinite loop
 
 
@@ -215,7 +225,13 @@ sub parsedata { my ( $buffer, $OUTF ) = @_;
                         )."\n";
       debugmsg ( "Saving record \"$record\"" );
       print $OUTF $record;
-      if ( $touchfilename ) { touch ( $touchfilename ); }
+      if ( $touchfilename )
+        {
+          if ( $touchcontent )
+            { touch ( $touchfilename, $record ); }
+          else
+            { touch ( $touchfilename ); }
+        }
     }
   else
     {
@@ -226,13 +242,24 @@ sub parsedata { my ( $buffer, $OUTF ) = @_;
 
 
 ############################################################
-sub touch { my ( $filename ) = @_;
+sub touch { my ( $filename, $content ) = @_;
 ############################################################
-  my $OUTF;
-  if ( open( $OUTF, ">>", $filename ) )
-    { close( $OUTF ); }
-  else
-    { warn "Could not touch file \"$filename\" $!\n"; }
+  if ( ( defined $content ) or ( ! -e $filename ) )
+    {
+      my $OUTF;
+      if ( open( $OUTF, ">", $filename ) )
+        {
+          print $OUTF ( $content // '' );
+          close( $OUTF );
+        }
+      else
+        { warn "Could not touch file \"$filename\": $!\n"; }
+    }
+  else  # just change file modification time
+    {
+      utime ( undef, undef, $filename ) or
+        warn "Could not touch file \"$filename\": $!\n";
+    }
 } # sub touch
 
 
