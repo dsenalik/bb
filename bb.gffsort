@@ -1,0 +1,266 @@
+#!/usr/bin/perl
+#----------------------------------------------------------#
+#        Author: Douglas Senalik dsenalik@wisc.edu         #
+#----------------------------------------------------------#
+# "Black Box" program series
+=bb
+Name and coordinate sort a gff3 file maintaining child features
+=cut bb
+use strict;
+use warnings;
+use Getopt::Long;      # for getting command line parameters
+
+
+
+############################################################
+# configuration variables
+############################################################
+my $gffheader = '##gff-version 3';
+
+
+
+############################################################
+# global variables
+############################################################
+my $ansiup    = "\033[1A";  # terminal control
+(my $prognopath = $0) =~ s/^.*[\/\\]//;
+
+
+
+############################################################
+# command line parameters
+############################################################
+my @infilenames;         # input file names
+my $outfilename;         # output file name
+my $reheader;            # remove old and create new header
+my $help;                # print help and exit
+my $quiet;               # only show errors
+my $debug;               # print extra debugging information
+GetOptions (
+            "infile=s"       => \@infilenames,       # string array
+            "outfile=s"      => \$outfilename,       # string
+            "reheader"       => \$reheader,          # flag
+            "help"           => \$help,              # flag
+            "quiet"          => \$quiet,             # flag
+            "debug"          => \$debug);            # flag
+# debug implies not quiet
+if ( $debug ) { $quiet = 0; }
+unless ( @infilenames ) { $help = 1 }
+unless ( $outfilename ) { $help = 1 }
+if ( $outfilename // '' eq "-" ) { $quiet = 1 }
+
+
+
+############################################################
+# print help screen
+############################################################
+if ( $help )
+  {
+    print "$prognopath
+
+Sort a gff3 file maintaining child features with the parent feature.
+Sort alphabetically by sequence name, then numerically by start and
+then by end coordinate.
+
+Required parameters:
+  --infile=xxx      input file name, use \"-\" for stdin,
+                    gzipped with \".gz\" extension okay,
+                    --infile can be used multiple times
+  --outfile=xxx     output file name, use \"-\" for stdout
+                    gzipped with \".gz\" extension okay
+
+Optional parameters:
+  --reheader        remove old header lines and create a new header:
+                    $gffheader
+                    useful if using more than one --infile
+  --help            print this screen
+  --quiet           only print error messages
+";
+#  --debug           print extra debugging information
+    exit 1;
+  } # if ( $help )
+
+
+
+############################################################
+# main processing loop: store in memory, sort, save to file
+############################################################
+{
+my @data;
+my $headers = '';
+for my $infilename ( @infilenames )
+  {
+    unless ( $quiet ) { print "Storing data from \"$infilename\"  ".timestr()."\n"; }
+    my $INF = stdopen ( "<", $infilename );
+    my $nlines = 0;
+    my $previd = '';
+    while ( my $aline = <$INF> )
+      {
+        $nlines++;
+        $aline =~ s/[\r\n]//g;
+        if ( $aline =~ m/^#/ )
+          { $headers .= $aline."\n"; }
+        elsif ( $aline !~ m/^\s*$/ )
+          {
+            my @cols = split ( /\t/, $aline );
+    
+            # detect child features by presence of "Parent=" tag
+            # or when ID= is exact same as previous ID=. If a child
+            # feature, use the array index of the previous record,
+            # i.e. the parent, otherwise generate a new array
+            # element at the end
+            my $child;
+            my $id;
+            if ( $cols[8] =~ m/Parent=[^;]+/ )
+              { $child = 1; }
+            if ( $cols[8] =~ m/ID=([^;]+)/ )
+              { $id = $1; }
+            my $index = $#data + 1;
+            if ( ( $child ) or ( ( defined $id ) and ( defined $previd ) and ( $id eq $previd ) ) )
+              { $index--; }
+            $previd = $id;
+    
+            # data is saved as a 3-dimensional array
+            push ( @{$data[$index]}, \@cols );
+          }
+      } # while <$INF>
+    stdclose ( $INF );
+    unless ( $quiet ) { print "Read ".commify($nlines)." lines\n"; }
+  } # for $infilename
+
+unless ( $quiet ) { print "Sorting  ".timestr()."\n"; }
+my @sorteddata = sort { $a->[0]->[0] cmp $b->[0]->[0] || $a->[0]->[3] <=> $b->[0]->[3] || $a->[0]->[4] <=> $b->[0]->[4] } @data;
+
+unless ( $quiet ) { print "Saving sorted data to \"$outfilename\"  ".timestr()."\n"; }
+if ( $reheader )
+  { $headers = "$gffheader\n"; }
+my $OUTF = stdopen ( ">", $outfilename );
+print $OUTF $headers;
+foreach my $arecord ( @sorteddata )
+  {
+    foreach my $arow ( @$arecord )
+      { print $OUTF join ( "\t", @$arow ), "\n"; }
+  }
+stdclose ( $OUTF );
+}
+
+
+
+############################################################
+# cleanup and end program
+############################################################
+unless ( $quiet ) { print "$0 Done\n"; }
+exit 0;
+
+
+
+############################################################
+sub debugmsg { my ( $text, $noreturn, $nolinenum ) = @_;
+############################################################
+  if ( $debug )
+    {
+      my ($package, $filename, $line, $sub) = caller(0);
+      unless ( $nolinenum ) { $text = "Line $line: " . $text; }
+      if ( ! ( $noreturn ) ) { $text .= "\n"; }
+      print $text;
+    } # if ( $debug )
+} # sub debugmsg
+
+
+
+###############################################################
+sub timestr {
+###############################################################
+  @_ = localtime(shift || time);
+  return(sprintf("%04d/%02d/%02d %02d:%02d:%02d", $_[5]+1900, $_[4]+1, $_[3], @_[2,1,0]));
+} # sub timestr
+
+
+
+###############################################################
+sub commify {
+###############################################################
+# http://perldoc.perl.org/perlfaq5.html#How-can-I-output-my-numbers-with-commas
+  local $_ = shift;
+  1 while s/^([-+]?\d+)(\d{3})/$1,$2/;
+  return $_;
+} # commify
+
+
+
+###############################################################
+sub stdopen { my ( $mode, $filename, $extratext ) = @_;
+###############################################################
+# a replacement for the three-parameter open which also allows
+# the use of "-" as the file name to mean STDIN or STDOUT
+  my $fh;  # the file handle
+  if ( $filename eq "-" )  # only exact match to "-" has special meaning
+    {
+      if ( $mode =~ m/>/ )
+        { $fh = *STDOUT }
+      else
+        { $fh = *STDIN }
+    }
+  else
+    {
+      # supplemental passed text for error messages, need one more space
+      if ( defined $extratext )
+        { $extratext .= " " }
+      else
+        { $extratext = "" }
+
+      my $text;  # this is only used for error message
+      if ( $mode =~ m/^\+?>>/ )  # ">>" or "+>>"
+        { $text = "append" }
+      elsif ( $mode =~ m/^\+?>/ )  # ">" or "+>"
+        { $text = "output" }
+      elsif ( $mode =~ m/^\+?</ )  # "<" or "+<"
+        { $text = "input" }
+      elsif ( $mode eq "-|" )
+        { $text = "piped input" }
+      elsif ( $mode eq "|-" )
+        { $text = "piped output" }
+      else
+        { die "Error, unsupported file mode \"$mode\" specified to stdopen( $mode, $filename, $extratext )\n"; }
+
+      # if file name ends in ".gz", gzip compression is assumed, and handle it transparently
+      if ( $filename =~ m/\.gz$/ )
+        {
+          if ( $mode =~ m/^>$/ ) # output mode
+            { $mode = "|-"; $filename = "gzip -c > \"$filename\""; }
+          elsif ( $mode =~ m/^<$/ ) # input mode
+            { $mode = "-|"; $filename = "gunzip -c \"$filename\""; }
+          else
+            { die "Error, can't handle gzip compression with mode \"$mode\" for file \"filename\"\n"; }
+        } # if gzip compressed file
+      elsif ( $filename	=~ m/\.bz2$/ )
+       	{
+          if ( $mode =~ m/^>$/ ) # output mode
+            { $mode = "|-"; $filename = "bzip2 -c > \"$filename\""; }
+          elsif ( $mode =~ m/^<$/ ) # input mode
+            { $mode = "-|"; $filename = "bunzip2 -c \"$filename\""; }
+          else
+            { die "Error, can't handle bzip2 compression with mode \"$mode\" for file \"filename\"\n"; }
+       	}
+      open ( $fh, $mode, $filename ) or die ( "Error opening ${extratext}file \"$filename\" for $text: $!\n" );
+    }
+  # return the opened file handle to the caller
+  return $fh;
+} # sub stdopen
+
+
+
+###############################################################
+sub stdclose { my ( $fh ) = @_;
+###############################################################
+# same as built-in close, except in case of STDIN or STDOUT,
+# and in this case the file handle is not closed
+
+  unless ( fileno($fh) <= 2 )  # if file number is this low, is stdin or stdout or stderr
+    { close ( $fh ) or die ( "Error closing file handle: $!\n" ); }
+
+} # sub stdclose
+
+
+
+# eof

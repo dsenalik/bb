@@ -96,6 +96,13 @@ from the 454 GS FLX sequencing platform
 [Plant Methods 2011, 7:38](http://www.plantmethods.com/content/7/1/38) doi:10.1186/1746-4811-7-38
 [Additional file 1](http://www.plantmethods.com/content/supplementary/1746-4811-7-38-s1.doc)
 
+bb.gffsort
+---------------
+
+Sort a gff3 file maintaining child features with the parent feature.
+Sort alphabetically by sequence name, then numerically by start and
+then by end coordinate.
+
 bb.motif
 --------
 

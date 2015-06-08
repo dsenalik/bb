@@ -46,6 +46,7 @@ my $OUTF;  # output file handle
 ############################################################
 my $portname;            # serial port device
 my $outfilename;         # output file name, use \"-\" for stdout
+my $touchfilename;       # touch this file every time data is received
 my $noheader     = 0;    # inhibit header line in output
 my $append       = 0;    # append to existing output file
 my $psi;                 # scale pressure from kPa to psi
@@ -55,6 +56,7 @@ my $debug        = 0;    # print extra debugging information
 GetOptions (
             "port=s"         => \$portname,          # string
             "outfile=s"      => \$outfilename,       # string
+            "touch=s"        => \$touchfilename,     # string
             "noheader"       => \$noheader,          # flag
             "append"         => \$append,            # flag
             "psi"            => \$psi,               # flag
@@ -89,6 +91,7 @@ Optional parameters:
                     than overwrite. --noheader is automatically
                     applied if file exists and is not empty
   --psi             convert kPa to psi by mulitplying by $psiperkpa
+  --touch=xxx       touch this file every time some data is received
   --help            print this screen
   --quiet           inhibit warning messages
   --debug           print extra debugging information
@@ -212,12 +215,25 @@ sub parsedata { my ( $buffer, $OUTF ) = @_;
                         )."\n";
       debugmsg ( "Saving record \"$record\"" );
       print $OUTF $record;
+      if ( $touchfilename ) { touch ( $touchfilename ); }
     }
   else
     {
       unless ( $quiet ) { print ( "incomplete record received, ".(length($buffer))." bytes\n" ); }
     }
 } # sub parsedata
+
+
+
+############################################################
+sub touch { my ( $filename ) = @_;
+############################################################
+  my $OUTF;
+  if ( open( $OUTF, ">>", $filename ) )
+    { close( $OUTF ); }
+  else
+    { warn "Could not touch file \"$filename\" $!\n"; }
+} # sub touch
 
 
 
