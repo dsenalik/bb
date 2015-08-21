@@ -24,6 +24,7 @@ my $gffheader = '##gff-version 3';
 ############################################################
 my $ansiup    = "\033[1A";  # terminal control
 (my $prognopath = $0) =~ s/^.*[\/\\]//;
+my %keysortorder;  # only used if --keyfile is specified
 
 
 
@@ -32,6 +33,7 @@ my $ansiup    = "\033[1A";  # terminal control
 ############################################################
 my @infilenames;         # input file names
 my $outfilename;         # output file name
+my $keyfilename;           # optional fasta file for sort order
 my $reheader;            # remove old and create new header
 my $help;                # print help and exit
 my $quiet;               # only show errors
@@ -39,6 +41,7 @@ my $debug;               # print extra debugging information
 GetOptions (
             "infile=s"       => \@infilenames,       # string array
             "outfile=s"      => \$outfilename,       # string
+            "keyfile=s"      => \$keyfilename,       # string
             "reheader"       => \$reheader,          # flag
             "help"           => \$help,              # flag
             "quiet"          => \$quiet,             # flag
@@ -59,8 +62,8 @@ if ( $help )
     print "$prognopath
 
 Sort a gff3 file maintaining child features with the parent feature.
-Sort alphabetically by sequence name, then numerically by start and
-then by end coordinate.
+Sort alphabetically by sequence name, or sort by order in --keyfile,
+then sort numerically by start and then by end coordinate.
 
 Required parameters:
   --infile=xxx      input file name, use \"-\" for stdin,
@@ -73,12 +76,24 @@ Optional parameters:
   --reheader        remove old header lines and create a new header:
                     $gffheader
                     useful if using more than one --infile
+  --keyfile=xxx     instead of sorting alphabetically, sort to the
+                    same order as is found in this file, it
+                    can either be a FASTA file, or a text file
+                    with one ID per line
   --help            print this screen
   --quiet           only print error messages
 ";
 #  --debug           print extra debugging information
     exit 1;
   } # if ( $help )
+
+
+
+############################################################
+# intialization
+############################################################
+if ( $keyfilename )
+  { makekeyorder( $keyfilename ); }
 
 
 
@@ -111,6 +126,7 @@ for my $infilename ( @infilenames )
             # element at the end
             my $child;
             my $id;
+            unless ( $cols[8] ) { die "Error, no column[8] line $nlines \"$aline\"\n"; }
             if ( $cols[8] =~ m/Parent=[^;]+/ )
               { $child = 1; }
             if ( $cols[8] =~ m/ID=([^;]+)/ )
@@ -129,7 +145,16 @@ for my $infilename ( @infilenames )
   } # for $infilename
 
 unless ( $quiet ) { print "Sorting  ".timestr()."\n"; }
-my @sorteddata = sort { $a->[0]->[0] cmp $b->[0]->[0] || $a->[0]->[3] <=> $b->[0]->[3] || $a->[0]->[4] <=> $b->[0]->[4] } @data;
+my @sorteddata;
+if ( %keysortorder )
+  # sort by order from the specified --keyfile
+  {
+    no warnings 'uninitialized';
+    @sorteddata = sort { $keysortorder{$a->[0]->[0]} <=> $keysortorder{$b->[0]->[0]} || $a->[0]->[3] <=> $b->[0]->[3] || $a->[0]->[4] <=> $b->[0]->[4] } @data;
+  }
+else
+  # sort alphabetically based on sequence id
+  { @sorteddata = sort { $a->[0]->[0] cmp $b->[0]->[0] || $a->[0]->[3] <=> $b->[0]->[3] || $a->[0]->[4] <=> $b->[0]->[4] } @data; }
 
 unless ( $quiet ) { print "Saving sorted data to \"$outfilename\"  ".timestr()."\n"; }
 if ( $reheader )
@@ -151,6 +176,36 @@ stdclose ( $OUTF );
 ############################################################
 unless ( $quiet ) { print "$0 Done\n"; }
 exit 0;
+
+
+
+############################################################
+sub makekeyorder { my ( $infilename ) = @_;
+############################################################
+# define global %keysortorder values to be the order from the specified
+# FASTA file, keys are part of FASTA header up to first white space
+  my $INF = stdopen( "<", $infilename );
+  my $isfasta = 0;
+  my $i = 0;
+  my $nlines = 0;
+  while ( my $aline = <$INF> )
+    {
+      $nlines++;
+      $aline =~ s/[\r\n]//g;
+      # autodetect if FASTA based on first line starting with '>'
+      if ( ( $nlines == 1 ) and ( $aline =~ m/^>/ ) )
+        { $isfasta = 1; }
+      if ( $isfasta )
+        {
+          if ( $aline =~ m/^>(\S+)/ )
+            { $keysortorder{$1} = $i++; }
+        }
+      else
+        { $keysortorder{$aline} = $i++; }
+    } # while <$INF>
+  stdclose( $INF );
+  debugmsg ( "Parsed ".commify($nlines)." lines from keyfile, ".commify($i)." indices stored" );
+} # sub makekeyorder
 
 
 

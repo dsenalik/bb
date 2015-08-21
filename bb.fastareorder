@@ -53,7 +53,8 @@ my %seen;         # for --unique
 my @infilenames = ();   # input file name(s)
 my $outfilename = "";   # output file name
 my $append      = 0;    # append to existing output file
-my $coordinates = "";   # output file for coordinates, where each contig starts and ends
+my $coordinates;        # output file for coordinates, where each contig starts and ends
+my $lifttable;          # make a lift table for later transferring annotation coordinates
 my @seq         = ();   # sequences to keep
 my @exclude     = ();   # sequences to exclude
 my $globalprefix = $defaultglobalprefix;
@@ -77,6 +78,7 @@ GetOptions (
             "infile=s"       => \@infilenames,       # string
             "outfile=s"      => \$outfilename,       # string
             "coordinates=s"  => \$coordinates,       # string
+            "lifttable=s"    => \$lifttable,         # string
             "sequence=s"     => \@seq,               # string array
             "exclude=s"      => \@exclude,           # string array
             "onesequence:s"  => \$oneseq,            # flag/string
@@ -151,6 +153,8 @@ Optional parameters:
                     and placed in random order
   --coordinates=xxx create this additional output file, which has
                     the starting and ending position of each contig
+  --lifttable=xxx   create a lift table compatible with --bb.liftgff,
+                    only useful if using --seq with subranges
   --onesequence[=xxx] concatenate all sequences into one. If a value
                     is specified, that is used as the header.
                     use --trim to inhibit supplemental info
@@ -350,6 +354,9 @@ if ( $doqual )
 ############################################################
 # --seq mode
 ############################################################
+my $LFT;
+if ( $lifttable )
+  { $LFT = stdopen( ">", $lifttable ); }
 for my $i ( 0 .. $#seq )
   {
     my $aseqnum = $seq[$i];
@@ -383,7 +390,7 @@ for my $i ( 0 .. $#seq )
     # get relevant sequence
     my $aseq;
     my $aqual = "";
-    if ( $aseqnum =~ m/^S(\d*)$/i )
+    if ( $aseqnum =~ m/^S(\d*)$/i )  # generate spacer
       {
         my $Nlen = $1;
         unless ( $Nlen ) { $Nlen = $spacerlen; }
@@ -494,12 +501,13 @@ for my $i ( 0 .. $#seq )
 
     # print header to ouput ( unless concatenating )
     $nseq++;
+    my $thishdr;
     unless ( defined $oneseq )
       {
         if ( $aseqnum !~ m/^S\d*$/i )  # skip spacer for multi-sequence mode
           {
             unless ( defined $inhdr{$aseqnum} ) { die "Error, undefined header for sequence number \"$aseqnum\", sequence index $nseq\n"; }
-            my $thishdr = ">" . replacewith($inhdr{$aseqnum});
+            $thishdr = ">" . replacewith($inhdr{$aseqnum});
             if ( $makeunique )
               {
                 $seen{$inhdr{$aseqnum}}++;
@@ -523,6 +531,17 @@ for my $i ( 0 .. $#seq )
     # print sequence to output, and follow with a return
     $outfdata .= $aseq . "\n";
 
+    # optional lift table
+    if ( ( $LFT ) and ( $thishdr ) )
+      {
+        # Lift table = newid newstart newend oldid oldstart oldend
+        ( my $id = $thishdr ) =~ s/\s.*$//;
+        $id =~ s/[>\n]//g;
+        unless ( $range[1] ) { $range[1] = 1; }
+        unless ( $range[2] ) { $range[1] = $seqlen; }
+        print $LFT join( "\t", $id, 1, $seqlen, $id, $range[1], $range[2] ), "\n";
+      }
+
     # optional spacer for --onesequence mode for all but last sequence
     if ( ( $spacer ) and ( $i < $#seq ) )
       { $outfdata .= 'N' x $spacer . "\n"; }
@@ -538,6 +557,7 @@ for my $i ( 0 .. $#seq )
     if ( $annotate )
       { $aseqnum = $ann }
   } # for my $i ( 0 .. $#seq )
+if ( $LFT ) { stdclose( $LFT ); }
 
 
 
