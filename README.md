@@ -154,3 +154,7 @@ http://flybase.org/static_pages/docs/software/topoview.html
 2009-2010 Victor Strelets, FlyBase.org
 
 This program creates TopoView tracks for GBrowse from .wig or .bed files
+
+To install prerequisites:
+sudo apt-get install libdb-dev
+sudo cpan BerkeleyDB
