@@ -33,7 +33,7 @@ my %keysortorder;  # only used if --keyfile is specified
 ############################################################
 my @infilenames;         # input file names
 my $outfilename;         # output file name
-my $keyfilename;           # optional fasta file for sort order
+my $keyfilename;         # optional fasta file for sort order
 my $reheader;            # remove old and create new header
 my $help;                # print help and exit
 my $quiet;               # only show errors
@@ -42,7 +42,7 @@ GetOptions (
             "infile=s"       => \@infilenames,       # string array
             "outfile=s"      => \$outfilename,       # string
             "keyfile=s"      => \$keyfilename,       # string
-            "reheader"       => \$reheader,          # flag
+            "reheader:s"     => \$reheader,          # string
             "help"           => \$help,              # flag
             "quiet"          => \$quiet,             # flag
             "debug"          => \$debug);            # flag
@@ -50,7 +50,12 @@ GetOptions (
 if ( $debug ) { $quiet = 0; }
 unless ( @infilenames ) { $help = 1 }
 unless ( $outfilename ) { $help = 1 }
-if ( $outfilename // '' eq "-" ) { $quiet = 1 }
+if ( ( $outfilename // '' ) eq "-" ) { $quiet = 1 }
+if ( defined $reheader )
+  {
+    $reheader =~ s/\\n/\n/g;
+    if ( $reheader !~ m/\n$/ ) { $reheader .= "\n"; }
+  }
 
 
 
@@ -69,21 +74,23 @@ Required parameters:
   --infile=xxx      input file name, use \"-\" for stdin,
                     gzipped with \".gz\" extension okay,
                     --infile can be used multiple times
+                    only header lines from the first input
+                    file are saved to the output file
   --outfile=xxx     output file name, use \"-\" for stdout
                     gzipped with \".gz\" extension okay
 
 Optional parameters:
-  --reheader        remove old header lines and create a new header:
-                    $gffheader
-                    useful if using more than one --infile
   --keyfile=xxx     instead of sorting alphabetically, sort to the
                     same order as is found in this file, it
                     can either be a FASTA file, or a text file
-                    with one ID per line
+                    with one ID per line. If sequence id is not in
+                    this list, then omit it from the output file
+  --reheader[=xxx]  replace header lines with this text, can be
+                    multiple lines (use \\n), or if null remove header
   --help            print this screen
   --quiet           only print error messages
+  --debug           print extra debugging information
 ";
-#  --debug           print extra debugging information
     exit 1;
   } # if ( $help )
 
@@ -92,6 +99,7 @@ Optional parameters:
 ############################################################
 # intialization
 ############################################################
+# set up global %keysortorder
 if ( $keyfilename )
   { makekeyorder( $keyfilename ); }
 
@@ -103,6 +111,8 @@ if ( $keyfilename )
 {
 my @data;
 my $headers = '';
+my $nfiltered = 0;
+my $fileindex = 0;
 for my $infilename ( @infilenames )
   {
     unless ( $quiet ) { print "Storing data from \"$infilename\"  ".timestr()."\n"; }
@@ -113,35 +123,50 @@ for my $infilename ( @infilenames )
       {
         $nlines++;
         $aline =~ s/[\r\n]//g;
+        # only save header lines from the first file, to avoid duplicate headers
         if ( $aline =~ m/^#/ )
-          { $headers .= $aline."\n"; }
-        elsif ( $aline !~ m/^\s*$/ )
+          {
+            if ( $fileindex == 0 )
+              { $headers .= $aline."\n"; }
+          }
+        elsif ( $aline !~ m/^\s*$/ )  # blank line removal
           {
             my @cols = split ( /\t/, $aline );
+
+            # if using --keyfile, drop if sequence id is not in the list
+            if ( ( %keysortorder ) and ( ! defined $keysortorder{$cols[0]} ) )
+              { $nfiltered++; }
+            else
+              {
+                # detect child features by presence of "Parent=" tag
+                # or when ID= is exact same as previous ID=. If a child
+                # feature, use the array index of the previous record,
+                # i.e. the parent, otherwise generate a new array
+                # element at the end
+                my $child;
+                my $id;
+                unless ( $cols[8] ) { die "Error, no column[8] line $nlines \"$aline\"\n"; }
+                if ( $cols[8] =~ m/Parent=[^;]+/ )
+                  { $child = 1; }
+                if ( $cols[8] =~ m/ID=([^;]+)/ )
+                  { $id = $1; }
+                my $index = $#data + 1;
+                if ( ( $child ) or ( ( defined $id ) and ( defined $previd ) and ( $id eq $previd ) ) )
+                  { $index--; }
+                $previd = $id;
     
-            # detect child features by presence of "Parent=" tag
-            # or when ID= is exact same as previous ID=. If a child
-            # feature, use the array index of the previous record,
-            # i.e. the parent, otherwise generate a new array
-            # element at the end
-            my $child;
-            my $id;
-            unless ( $cols[8] ) { die "Error, no column[8] line $nlines \"$aline\"\n"; }
-            if ( $cols[8] =~ m/Parent=[^;]+/ )
-              { $child = 1; }
-            if ( $cols[8] =~ m/ID=([^;]+)/ )
-              { $id = $1; }
-            my $index = $#data + 1;
-            if ( ( $child ) or ( ( defined $id ) and ( defined $previd ) and ( $id eq $previd ) ) )
-              { $index--; }
-            $previd = $id;
-    
-            # data is saved as a 3-dimensional array
-            push ( @{$data[$index]}, \@cols );
-          }
+                # data is saved as a 3-dimensional array
+                push ( @{$data[$index]}, \@cols );
+              } # else not filtered out
+          } # else not blank line
       } # while <$INF>
     stdclose ( $INF );
-    unless ( $quiet ) { print "Read ".commify($nlines)." lines\n"; }
+    unless ( $quiet )
+      {
+        print "Read ".commify($nlines)." lines\n";
+        if ( %keysortorder ) { print "Filtered out ".commify($nfiltered)." lines not present in \"$keyfilename\"\n"; }
+      }
+    $fileindex++;
   } # for $infilename
 
 unless ( $quiet ) { print "Sorting  ".timestr()."\n"; }
@@ -149,16 +174,21 @@ my @sorteddata;
 if ( %keysortorder )
   # sort by order from the specified --keyfile
   {
-    no warnings 'uninitialized';
-    @sorteddata = sort { $keysortorder{$a->[0]->[0]} <=> $keysortorder{$b->[0]->[0]} || $a->[0]->[3] <=> $b->[0]->[3] || $a->[0]->[4] <=> $b->[0]->[4] } @data;
+    @sorteddata = sort { $keysortorder{$a->[0]->[0]} <=> $keysortorder{$b->[0]->[0]}
+                      || $a->[0]->[3] <=> $b->[0]->[3]
+                      || $a->[0]->[4] <=> $b->[0]->[4] } @data;
   }
 else
   # sort alphabetically based on sequence id
-  { @sorteddata = sort { $a->[0]->[0] cmp $b->[0]->[0] || $a->[0]->[3] <=> $b->[0]->[3] || $a->[0]->[4] <=> $b->[0]->[4] } @data; }
+  {
+    @sorteddata = sort { $a->[0]->[0] cmp $b->[0]->[0]
+                      || $a->[0]->[3] <=> $b->[0]->[3]
+                      || $a->[0]->[4] <=> $b->[0]->[4] } @data;
+  }
 
 unless ( $quiet ) { print "Saving sorted data to \"$outfilename\"  ".timestr()."\n"; }
-if ( $reheader )
-  { $headers = "$gffheader\n"; }
+if ( defined $reheader )
+  { $headers = $reheader; }
 my $OUTF = stdopen ( ">", $outfilename );
 print $OUTF $headers;
 foreach my $arecord ( @sorteddata )
