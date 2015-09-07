@@ -146,3 +146,11 @@ This program acts as a pipe, and will insert time stamps in the stream,
 useful for monitoring long-running programs that do not themselves
 output timestamps
 
+bb.topoview
+--------------
+
+A wrapper around code originally from a script from
+http://flybase.org/static_pages/docs/software/topoview.html
+2009-2010 Victor Strelets, FlyBase.org
+
+This program creates TopoView tracks for GBrowse from .wig or .bed files
