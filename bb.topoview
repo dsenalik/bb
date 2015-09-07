@@ -1,0 +1,711 @@
+#!/usr/bin/perl
+#----------------------------------------------------------#
+#        Author: Douglas Senalik dsenalik@wisc.edu         #
+#----------------------------------------------------------#
+# "Black Box" program series
+=bb
+Data formatter and indexer for TopoView GBrowse track
+=cut bb
+# based on script from http://flybase.org/static_pages/docs/software/topoview.html
+# 2009-2010 Victor Strelets, FlyBase.org 
+use strict;
+use warnings;
+use Getopt::Long;      # for getting command line parameters
+use BerkeleyDB;        # installable with cpan
+use File::Spec;        # path manipulation
+
+
+
+############################################################
+# configuration variables
+############################################################
+my %LogTabs= ( 0, 0, 1, 0 ); # for our purposes, these start values are right
+my $defaultfilesmask = '*.wig';
+my $defaultcrop = "250";
+my $do_only_subset;
+my $do_only_chr;
+my $defaultlognum = 100;
+my $datfilename = "data.cat";
+my $bdbfilename = "index.bdbhash";
+
+# leftovers from original program
+##$testing= 300000; # never used
+#$debug= 1; $do_only_chr= '2L';  
+#$debug= 1; $do_only_chr= '2L'; $do_only_subset= 'BS40_all_unique'; 
+#$debug= 1; $do_only_subset= 'Female_Heads'; $do_only_chr= '2';
+
+
+
+############################################################
+# global variables
+############################################################
+my $ansiup    = "\033[1A";  # terminal control
+(my $prognopath = $0) =~ s/^.*[\/\\]//;
+my $log2 = log(2);
+# %ResIndexHash in the original code was commented as global
+my %ResIndexHash;
+# but these others were just floating there (use strict was not used)
+my @SubsetNames;
+my $signal;
+my $max_signal;
+
+
+
+############################################################
+# command line parameters
+############################################################
+my $indir;               # input directory name
+my $outdir;              # output directory name
+my $filesmask = $defaultfilesmask;
+my $apply_log;           # apply a log base 2 transformation
+my $log_magnifier= 1.0;  # scaling
+my $crop = $defaultcrop; # values larger than this are made equal to this
+my $lognum = -1;         # how many chromosomes to print to log -1=all, 0=none, >=1=this many
+my $force = 0;           # make index if already exists
+my $help;                # print help and exit
+my $quiet;               # only show errors
+my $debug;               # print extra debugging information
+GetOptions (
+            "indirectory=s"  => \$indir,             # string
+            "outdirectory=s" => \$outdir,            # string
+            "mask=s"         => \$filesmask,         # string
+            "log"            => \$apply_log,         # flag
+            "magnify|scale=s"=> \$log_magnifier,     # flag
+            "crop=s"         => \$crop,              # string
+            "part:i"         => \$lognum,            # flag or integer
+            "force"          => \$force,             # flag
+            "help"           => \$help,              # flag
+            "quiet"          => \$quiet,             # flag
+            "debug"          => \$debug);            # flag
+# debug implies not quiet
+if ( $debug ) { $quiet = 0; }
+if ( $lognum eq "" ) { $lognum = $defaultlognum; }
+unless ( $indir ) { $help = 1; }
+unless ( $outdir ) { $outdir = $indir; }
+
+
+
+############################################################
+# print help screen
+############################################################
+if ( $help )
+  {
+    print "$prognopath
+Required parameters:
+  --indirectory=xxx directory containing files
+Optional parameters:
+  --outdirectory=xxx location of generated index files. If not
+                    specified, will be --indirectory
+  --mask=xxx        wiggle file mask, default = \"$defaultfilesmask\"
+                    another common option would be \"*.bed\" or \"*.bed.gz\"
+  --log             apply log base 2 transformation
+  --magnify=xxx     apply this scaling factor to values,
+                    done after log transform if using
+                    --log, default = 1.0
+                    e.g. value of 10 makes values 10x larger
+  --scale=xxx       synonym for --magnify
+  --crop=xxx        after applying --log and --magnify, if used,
+                    this will be the maximum value returned,
+                    default=$defaultcrop or use 0 to disable
+  --part[=xxx]      print this many chromosomes to log
+                    0=none, >=1=that many, default number=$defaultlognum
+                    but if not specified, then all chromosomes are printed
+  --force           overwrite existing database if it already exists
+  --help            print this screen
+  --quiet           only print error messages
+  --debug           print extra debugging information
+";
+    exit 1;
+  } # if ( $help )
+
+
+
+############################################################
+# main
+############################################################
+unless ( -d $indir ) { die "Error, --indirectory \"$indir\" does not exist\n"; }
+if ( ( not $quiet ) and ( $apply_log ) )
+  { print "Will apply log(2) transformation of data\n"; }
+unless ( $quiet ) { print "Indexing $filesmask files\n"; }
+indexfeatdir ( $indir, $outdir, $filesmask );
+
+
+
+############################################################
+# cleanup and end program
+############################################################
+unless ( $quiet ) { print "Done\n"; }
+exit 0;
+
+
+
+############################################################
+sub debugmsg { my ( $text, $noreturn, $nolinenum ) = @_;
+############################################################
+  if ( $debug )
+    {
+      my ($package, $filename, $line, $sub) = caller(0);
+      unless ( $nolinenum ) { $text = "Line $line: " . $text; }
+      if ( ! ( $noreturn ) ) { $text .= "\n"; }
+      print $text;
+    } # if ( $debug )
+} # sub debugmsg
+
+
+
+###############################################################
+sub timestr {
+###############################################################
+  @_ = localtime(shift || time);
+  return(sprintf("%04d/%02d/%02d %02d:%02d:%02d", $_[5]+1900, $_[4]+1, $_[3], @_[2,1,0]));
+} # sub timestr
+
+
+
+###############################################################
+sub commify {
+###############################################################
+# http://perldoc.perl.org/perlfaq5.html#How-can-I-output-my-numbers-with-commas
+  local $_ = shift;
+  1 while s/^([-+]?\d+)(\d{3})/$1,$2/;
+  return $_;
+} # commify
+
+
+
+###############################################################
+sub stdopen { my ( $mode, $filename, $extratext ) = @_;
+###############################################################
+# a replacement for the three-parameter open which also allows
+# the use of "-" as the file name to mean STDIN or STDOUT
+  my $fh;  # the file handle
+  if ( $filename eq "-" )  # only exact match to "-" has special meaning
+    {
+      if ( $mode =~ m/>/ )
+        { $fh = *STDOUT }
+      else
+        { $fh = *STDIN }
+    }
+  else
+    {
+      # supplemental passed text for error messages, need one more space
+      if ( defined $extratext )
+        { $extratext .= " " }
+      else
+        { $extratext = "" }
+
+      my $text;  # this is only used for error message
+      if ( $mode =~ m/^\+?>>/ )  # ">>" or "+>>"
+        { $text = "append" }
+      elsif ( $mode =~ m/^\+?>/ )  # ">" or "+>"
+        { $text = "output" }
+      elsif ( $mode =~ m/^\+?</ )  # "<" or "+<"
+        { $text = "input" }
+      elsif ( $mode eq "-|" )
+        { $text = "piped input" }
+      elsif ( $mode eq "|-" )
+        { $text = "piped output" }
+      else
+        { die "Error, unsupported file mode \"$mode\" specified to stdopen( $mode, $filename, $extratext )\n"; }
+
+      # if file name ends in ".gz", gzip compression is assumed, and handle it transparently
+      if ( $filename =~ m/\.gz$/ )
+        {
+          if ( $mode =~ m/^>$/ ) # output mode
+            { $mode = "|-"; $filename = "gzip -c > \"$filename\""; }
+          elsif ( $mode =~ m/^<$/ ) # input mode
+            { $mode = "-|"; $filename = "gunzip -c \"$filename\""; }
+          else
+            { die "Error, can't handle gzip compression with mode \"$mode\" for file \"filename\"\n"; }
+        } # if gzip compressed file
+      open ( $fh, $mode, $filename ) or die ( "Error opening ${extratext}file \"$filename\" for $text: $!\n" );
+    }
+  # return the opened file handle to the caller
+  return $fh;
+} # sub stdopen
+
+
+
+###############################################################
+sub stdclose { my ( $fh ) = @_;
+###############################################################
+# same as built-in close, except in case of STDIN or STDOUT,
+# and in this case the file handle is not closed
+
+  unless ( fileno($fh) <= 2 )  # if file number is this low, is stdin or stdout or stderr
+    { close ( $fh ) or die ( "Error closing file handle: $!\n" ); }
+
+} # sub stdclose
+
+
+
+#*************************************************************************
+sub indexfeatdir { my ( $dir, $outdir, $mask ) = @_;
+#*************************************************************************
+  my $ntoprint = $lognum;
+  # original code ignored $mask, here it is replaced with a glob
+  my @files = glob ( File::Spec->catfile( $dir, $mask ) );
+  unless ( $quiet ) { print "Found ".commify(scalar @files)." files to process in directory \"$dir\" matching \"$mask\"\n"; }
+  unless ( @files ) { die "No files found in directory \"$dir\" with mask \"$mask\", terminating\n"; }
+  # original version, deactivated but left for reference
+  #local(*D); opendir(D, $dir) || warn "can't open $dir";
+  #my @files= grep( /\.(cov|wig)/i, readdir(D));
+  #closedir(D);
+  
+  # system("rm $datfilename") if -e $datfilename; # replace with Perl version below
+  # unlink($bdbfilename) if( -e $bdbfilename ); # why was this unlink and the one above was rm?
+  my $localdatfilename = File::Spec->catfile( $outdir, $datfilename );
+  my $localbdbfilename = File::Spec->catfile( $outdir, $bdbfilename );
+  if ( ( -e $localdatfilename ) or ( -e $localbdbfilename ) )
+    {
+      unless ( $force )
+        {
+          unless ( $quiet ) { print "Found existing index, no changes made\n"; }
+          return;
+        }
+      unless ( $quiet ) { print "Old index exists. Removing it and generating new index\n"; }
+      if ( -e $localdatfilename ) { unlink $localdatfilename or die "Error removing old file \"$localdatfilename\": $!\n"; }
+      if ( -e $localbdbfilename ) { unlink $localbdbfilename or die "Error removing old file \"$localbdbfilename\": $!\n"; }
+    }
+
+  open(OUTDATF,'>'.$localdatfilename) || die "Cannot open \"$localdatfilename\" for output: $!\n";
+  %ResIndexHash= (); # !!GLOBAL
+  tie %ResIndexHash, "BerkeleyDB::Hash", -Filename => $localbdbfilename, -Flags => DB_CREATE;
+
+  $max_signal = 0;  # global
+  @SubsetNames= ();
+  foreach my $file (sort @files)
+    {
+      unless ( $quiet ) { print "Indexing file \"$file\" ".timestr()."\n"; }
+      indexCoverageFile($file); # coverage files are in fact wiggle files..
+    }
+  $ResIndexHash{'subsets'}= join("\t",@SubsetNames); # record subsets, just in case..
+  $ResIndexHash{'max_signal'}= $max_signal;
+  my @all_keys= keys %ResIndexHash;
+  foreach my $kkey ( sort @all_keys )
+    {
+      if ( $ntoprint )
+        {
+          print "\t$kkey => ".$ResIndexHash{$kkey}."\n";
+          $ntoprint--;
+          unless ( $ntoprint ) { print "\tRemainder not shown...\n"; last; }
+        }
+    }
+  if ( $max_signal > 10000 ) { print "WARNING: max_signal=$max_signal - TOO HIGH! Re-run with '-log' option\n"; } 
+  if ( $max_signal <= 0 ) { print "WARNING: max_signal=$max_signal - TOO LOW! Probably bad input\n"; }
+  untie %ResIndexHash;
+  chmod(0666,$localbdbfilename); # ! sometimes very important
+  close(OUTDATF);
+
+  return;
+} # sub indexfeatdir
+
+
+
+#*************************************************************************
+sub indexCoverageFile { my ( $file ) = @_;
+#*************************************************************************
+  # to reduce amount of output, only print first 100 $chromosome
+  my $ntoprint = $lognum;
+  # modifies global $max_signal
+  if( $debug && defined $do_only_subset )
+    { return unless $file=~/^${do_only_subset}\./; }
+  my $zcat= get_zcat($file);
+  local(*INF);
+  open(INF,"$zcat $file |") || die "Can't open \"$file\" for input: $!\n";
+  my $SubsetName= ($file=~/^([^\.]+)\./) ? $1 : $file;
+  push(@SubsetNames,$SubsetName);
+  my $chromosome= "";
+  my @offsets= ();
+  # following setting is very important for performance (in some cases)
+  # value 1000 (otherwise good) on K.White dataset was causing start of reading 100K before the actually required point..
+  my $step= 1000; # step in coverage file lines ()signal reads to save start-offset
+  my $coordstep= 20000; # step in coords to save start-offset
+  my $counter= 0;
+  my $offset= tell(OUTDATF);
+  $ResIndexHash{$SubsetName}= $offset; # record offset where new subset data starts
+  my $old_signal= 0;
+  my $oldcoord= -200000;
+  my $FileFormat= 1;
+  my $StartCoord= 0;
+  my $lastRecordedCoord= -200000;
+  debugmsg ( "Indexing file \"$file\" SubsetName=\"$SubsetName\" offset=$offset" );
+  my $nlines = 0;
+  my $nchr = 0;
+  while( (my $str= <INF>) )
+    {
+    $nlines++;
+    $offset= tell(OUTDATF);
+
+    # correct variant of GEO preferred subset spec
+    if( $str=~m/^(track[ \t]+type=wiggle_0)\s*\n$/i ) # new subset starting
+      {
+        $str= $1 . ' name="' . $SubsetName ."\"\n";
+        debugmsg ( "Match at A str=\"$str\"" );
+      }
+
+    # following is a GEO preferred subset spec
+    if( $str=~m/^track[ \t]+type=wiggle_0[ \t]+name="([^"]+)"/i ) # new subset starting
+      {
+        $FileFormat= 4;
+        $SubsetName= $1;
+        #$chromosome= ""; 
+        debugmsg ( "Match at B format=$FileFormat" );
+        next; # because it is not a signal, should not be printed in this data loop
+      }
+
+    # fix for K.White files
+    elsif( $str=~m/^track[ \t]+type=bedGraph[ \t]+name="([^"]+)"/i ) # new subset starting
+      {
+        $FileFormat= 4;
+        $SubsetName=~s/_(combined|coverage)$//i; $SubsetName=~s/_(combined|coverage)$//i; $SubsetName=~s/^G[A-Z]{2}\d+[_\-]//;
+        #$chromosome= ""; 
+        debugmsg ( "Match at C format=$FileFormat" );
+        next; # because it is not a signal, should not be printed in this data loop
+      }
+
+    elsif( $str=~m/^variableStep[ \t]+(chr(om(osome)?)?|arm)=(\w+)/i ) # potentially new arm starting
+      {
+      $FileFormat= 4;
+      my $new_chromosome= $4; 
+      # VCRU disable this next line from the original code, don't modify any names!
+      # $new_chromosome=~s/^chr(omosome)?//i;
+      debugmsg ( "Match at D format=$FileFormat" );
+      if( $new_chromosome ne $chromosome )
+        {
+        debugmsg ( "New chromosome \"$new_chromosome\" starting line $nlines" );
+        $nchr++;
+        dumpOffsets($SubsetName.':'.$chromosome,@offsets) unless $chromosome eq ""; # previous subset:arm
+        $chromosome= $new_chromosome;
+        print OUTDATF "# subset=$SubsetName chromosome=$chromosome\n";
+        $offset= tell(OUTDATF);
+        $ResIndexHash{$SubsetName.':'.$chromosome}= $offset; # record offset where new subset:arm data starts
+        @offsets= ("-200000\t$offset");
+        print OUTDATF "-200000\t0\n"; # insert one fictive zero read
+        $offset= tell(OUTDATF);
+        print OUTDATF "0\t0\n"; # insert one more fictive zero read
+        push(@offsets,"0\t$offset"); 
+        if ( $ntoprint )
+          {
+            print "\t\t$SubsetName:$chromosome\n";
+            $ntoprint--;
+            unless ( $ntoprint ) { print "\t\tRemainder not shown...\n"; }
+          }
+        $counter= 0; $old_signal= 0; $oldcoord= 0; $lastRecordedCoord= 0;
+        }
+      next; # because it is not a signal, should not be printed in this data loop
+      }
+
+    elsif( $str=~m/^FixedStep[ \t]+(chr(om(osome)?)?|arm)=(\w+)[ \t]+Start=(\d+)/i ) # potentially new arm starting
+      {
+      $FileFormat= 3;
+      my $new_chromosome= $4; 
+      $StartCoord= $5;
+      # VCRU disable this next line from the original code, don't modify any names!
+      # $new_chromosome=~s/^chr(omosome)?//i;
+      debugmsg ( "Match at E format=$FileFormat" );
+      if( $new_chromosome ne $chromosome )
+        {
+        debugmsg ( "New chromosome \"$new_chromosome\" starting line $nlines" );
+        $nchr++;
+        dumpOffsets($SubsetName.':'.$chromosome,@offsets) unless $chromosome eq ""; # previous subset:arm
+        $chromosome= $new_chromosome;
+        print OUTDATF "# subset=$SubsetName chromosome=$chromosome\n";
+        $offset= tell(OUTDATF);
+        $ResIndexHash{$SubsetName.':'.$chromosome}= $offset; # record offset where new subset:arm data starts
+        @offsets= ("-200000\t$offset");
+        print OUTDATF "-200000\t0\n"; # insert one fictive zero read
+        $offset= tell(OUTDATF);
+        print OUTDATF "0\t0\n"; # insert one more fictive zero read
+        push(@offsets,"0\t$offset"); 
+        if ( $ntoprint )
+          {
+            print "\t\t$SubsetName:$chromosome\n";
+            $ntoprint--;
+            unless ( $ntoprint ) { print "\t\tRemainder not shown...\n"; }
+          }
+        $counter= 0; $old_signal= 0; $oldcoord= 0; $lastRecordedCoord= 0;
+        }
+      elsif( $StartCoord>$oldcoord+1 ) # hole, fill with zeros
+        {
+        $oldcoord++; 
+        #print " hole (zeros) from $oldcoord to $StartCoord-1\n" if $debug;
+        print OUTDATF $oldcoord."\t0\n" unless $old_signal==0;
+        $old_signal= 0;
+        next if $signal==0; # no need to duplicate zeros..
+        }
+      elsif( $StartCoord<$oldcoord )
+        { print "WARNING: backward ref in $file: $str"; }
+      next; # because it is not a signal, should not be printed in this data loop
+      }
+
+    elsif( $str=~m/^[#]?.*(chr(om(osome)?)?|arm)=(\w+)/ ) # potentially new arm starting
+      {
+      $FileFormat= 1;
+      my $new_chromosome= $4; 
+      # VCRU disable this next line from the original code, don't modify any names!
+      # $new_chromosome=~s/^chr(omosome)?//i;
+      debugmsg ( "Match at F format=$FileFormat" );
+      if( $new_chromosome ne $chromosome )
+        {
+        debugmsg ( "New chromosome \"$new_chromosome\" starting line $nlines" );
+        $nchr++;
+        dumpOffsets($SubsetName.':'.$chromosome,@offsets) unless $chromosome eq ""; # previous subset:arm
+        $chromosome= $new_chromosome;
+        print OUTDATF "# subset=$SubsetName chromosome=$chromosome\n";
+        $offset= tell(OUTDATF);
+        $ResIndexHash{$SubsetName.':'.$chromosome}= $offset; # record offset where new subset:arm data starts
+        @offsets= ("-200000\t$offset");
+        print OUTDATF "-200000\t0\n"; # insert one fictive zero read
+        $offset= tell(OUTDATF);
+        print OUTDATF "0\t0\n"; # insert one more fictive zero read
+        push(@offsets,"0\t$offset"); 
+        if ( $ntoprint )
+          {
+            print "\t\t$SubsetName:$chromosome\n";
+            $ntoprint--;
+            unless ( $ntoprint ) { print "\t\tRemainder not shown...\n"; }
+          }
+        $counter= 0; $old_signal= 0; $oldcoord= 0; $lastRecordedCoord= 0;
+        }
+      next; # because it is not a signal, should not be printed in this data loop
+      }
+
+    elsif(  $str=~m/^[#]/ ) # other unspecified comments
+      {
+        debugmsg ( "Skipping comment line $nlines: \"$str\"" );
+        next;
+      }
+
+    elsif( $str=~m/^(\d+)[ \t]+(\d+)\s*\n/ ) { # [coord signal] format
+      $FileFormat= 1;
+      my($coord,$signal)= ($1,$2);
+      $signal= modifySignal($signal);
+      if( $signal==$old_signal )
+        {
+        $oldcoord= $coord;
+        next;
+        }
+      $max_signal= $signal if $max_signal<$signal;
+      if( $counter++>$step || $coord-$lastRecordedCoord>$coordstep )
+        { push(@offsets,"$coord\t$offset"); $counter= 0; $lastRecordedCoord= $coord; }
+      $str= $coord."\t".$signal."\n";
+      $oldcoord= $coord;
+      $old_signal= $signal;
+      }
+
+    # following is a GEO preferred format
+    # VCRU added allowed decimal point in fourth column and in first column
+# VCRU sample bed format
+#track type=wiggle_0 name="soapunpaired" description="B493QAL EST fine coverage of soapunpaired"
+#C10000184	1	10	0.0
+#C10000184	11	20	0.2
+    elsif( $str=~m/^([\w\.]+)[ \t]+(\d+)[ \t]+(\d+)[ \t]+[\-]?([\d\.]+)\s*\n/ ) # [chr coord tocoord signal] format, all positions and skipped zeros
+      {
+      $FileFormat= 4;
+      my($new_chromosome,$coord,$tocoord,$signal)= ($1,$2,$3,$4);
+      my $samesignal_l= $tocoord-$coord;
+      # VCRU disable this next line from the original code, don't modify any names!
+      # $new_chromosome=~s/^chr(omosome)?//i;
+      if( $debug && defined $do_only_chr )
+        { next unless $new_chromosome eq $do_only_chr; }
+      $signal= modifySignal($signal);
+      if( $new_chromosome ne $chromosome )
+        {
+        debugmsg ( "New chromosome \"$new_chromosome\" starting line $nlines" );
+        $nchr++;
+        dumpOffsets($SubsetName.':'.$chromosome,@offsets) unless $chromosome eq ""; # previous subset:arm
+        $chromosome= $new_chromosome;
+        print OUTDATF "# subset=$SubsetName chromosome=$chromosome\n";
+        $offset= tell(OUTDATF);
+        $ResIndexHash{$SubsetName.':'.$chromosome}= $offset; # record offset where new subset:arm data starts
+        @offsets= ("-200000\t$offset");
+        print OUTDATF "-200000\t0\n"; # insert one fictive zero read
+        $offset= tell(OUTDATF);
+        print OUTDATF "0\t0\n"; # insert one more fictive zero read
+        push(@offsets,"0\t$offset"); 
+        if ( $ntoprint )
+          {
+            print "\t\t$SubsetName:$chromosome\n";
+            $ntoprint--;
+            unless ( $ntoprint ) { print "\t\tRemainder not shown...\n"; }
+          }
+        $counter= 0; $old_signal= 0; $oldcoord= 0; $lastRecordedCoord= 0;
+        }
+      if( $coord>$oldcoord+1 ) # hole, fill with zeros
+        {
+        $oldcoord++; 
+        debugmsg ( "hole (zeros) from $oldcoord to $coord-1" );
+        print OUTDATF $oldcoord."\t0\n" unless $old_signal==0;
+        $old_signal= 0;
+        next if $signal==0; # no need to duplicate zeros..
+        }
+      elsif( $signal==$old_signal ) { 
+        $oldcoord= $coord;
+        next;
+        }
+      $max_signal= $signal if $max_signal<$signal;
+      if( $counter++>$step || $coord-$lastRecordedCoord>$coordstep )
+        { push(@offsets,"$coord\t$offset"); $counter= 0; $lastRecordedCoord= $coord; }
+      $str= $coord."\t".$signal."\n";
+      $oldcoord= $coord+$samesignal_l-1;
+      $old_signal= $signal;
+      }
+
+    elsif( $str=~m/^(\w+)[ \t]+(\d+)[ \t]+(\d+)\s*\n/ ) # [chr coord signal] format, all positions but skipped zeros
+      {
+      $FileFormat= 2;
+      my($new_chromosome,$coord,$signal)= ($1,$2,$3);
+      # VCRU disable this next line from the original code, don't modify any names!
+      # $new_chromosome=~s/^chr(omosome)?//i;
+      if( $debug && defined $do_only_chr )
+        { next unless $new_chromosome eq $do_only_chr; }
+      $signal= modifySignal($signal);
+      if( $new_chromosome ne $chromosome )
+        {
+        debugmsg ( "New chromosome \"$new_chromosome\" starting line $nlines" );
+        $nchr++;
+        dumpOffsets($SubsetName.':'.$chromosome,@offsets) unless $chromosome eq ""; # previous subset:arm
+        $chromosome= $new_chromosome;
+        print OUTDATF "# subset=$SubsetName chromosome=$chromosome\n";
+        $offset= tell(OUTDATF);
+        $ResIndexHash{$SubsetName.':'.$chromosome}= $offset; # record offset where new subset:arm data starts
+        @offsets= ("-200000\t$offset");
+        print OUTDATF "-200000\t0\n"; # insert one fictive zero read
+        $offset= tell(OUTDATF);
+        print OUTDATF "0\t0\n"; # insert one more fictive zero read
+        push(@offsets,"0\t$offset"); 
+        if ( $ntoprint )
+          {
+            print "\t\t$SubsetName:$chromosome\n";
+            $ntoprint--;
+            unless ( $ntoprint ) { print "\t\tRemainder not shown...\n"; }
+          }
+        $counter= 0; $old_signal= 0; $oldcoord= 0; $lastRecordedCoord= 0;
+        }
+      if( $coord>$oldcoord+1 ) # hole, fill with zeros
+        {
+        $oldcoord++; 
+        #print " hole (zeros) from $oldcoord to $coord-1\n" if $debug;
+        print OUTDATF $oldcoord."\t0\n" unless $old_signal==0;
+        $old_signal= 0;
+        next if $signal==0; # no need to duplicate zeros..
+        }
+      elsif( $signal==$old_signal )
+        {
+        $oldcoord= $coord;
+        next;
+        }
+      $max_signal= $signal if $max_signal<$signal;
+      if( $counter++>$step || $coord-$lastRecordedCoord>$coordstep ) { 
+        push(@offsets,"$coord\t$offset"); $counter= 0; $lastRecordedCoord= $coord; }
+      $str= $coord."\t".$signal."\n";
+      $oldcoord= $coord;
+      $old_signal= $signal;
+      }
+
+    elsif( $str=~m/^(\d+)\s*\n/ ) # [signal] format, all positions and skipped zeros
+      {
+      $FileFormat= 3;
+      my($coord,$signal)= ($StartCoord++,$1);
+      $signal= modifySignal($signal);
+      if( $signal==$old_signal )
+        { 
+        $oldcoord= $coord;
+        next;
+        }
+      $max_signal= $signal if $max_signal<$signal;
+      if( $counter++>$step || $coord-$lastRecordedCoord>$coordstep )
+        { push(@offsets,"$coord\t$offset"); $counter= 0; $lastRecordedCoord= $coord; }
+      $str= $coord."\t".$signal."\n";
+      $oldcoord= $coord;
+      $old_signal= $signal;
+      }
+
+    else  # skip other data - unknown format
+      { 
+        print ( "Skipping unknown data line $nlines: \"$str\"\n" );
+        next;
+      }
+    print OUTDATF $str;
+    }
+  # don't forget to dump offsets data on file end..
+  dumpOffsets($SubsetName.':'.$chromosome,@offsets) unless $chromosome eq ""; # previous subset:arm
+  close(INF);
+  unless ( $quiet ) { print "Processed ".commify($nlines)." lines, ".commify($nchr)." chromosomes in file \"$file\"\n"; }
+  return;
+} # sub indexCoverageFile
+
+
+
+#*************************************************************************
+sub modifySignal { my $signal = shift;
+#*************************************************************************
+  if ( $apply_log )
+    {
+      if( exists $LogTabs{$signal} )
+        { $signal = $LogTabs{$signal}; }
+      else
+        {
+          # log base 2, and then apply magnification (default 1.0)
+          my $newval;
+          if ( $signal >= 1 ) # can't take log of zero, and below 1 is negative
+            { $newval = int(log($signal)*$log_magnifier/$log2); }
+          else
+            { $newval = 0; }
+          $LogTabs{$signal} = $newval;
+          $signal = $newval;
+        }
+    }
+  else
+    { $signal = int($signal * $log_magnifier); }
+  if ( ( $crop ) and ( $signal > $crop ) ) { $signal = $crop; }
+  return($signal);
+} # sub modifySignal
+
+
+
+#*************************************************************************
+sub dumpOffsets { my ( $key, @offsetlines ) = @_;
+#*************************************************************************
+  print OUTDATF "# offsets for $key\n";
+  my $offset= tell(OUTDATF);
+  my $prevoffset= $offset;
+  $ResIndexHash{$key.':offsets'}= $offset; # record offset where offsets VALUES for subset:arm data start (skip header)
+  my $oldbigstep= 0;
+  foreach my $str ( @offsetlines )
+    {
+    print OUTDATF $str . "\n"; 
+    my($coord,$floffset)= split(/[ \t]+/,$str);
+    # following wasn't working properly..
+    my $newbigstep= int($coord/1000000.0);
+    if( $newbigstep>$oldbigstep )
+      {
+      $ResIndexHash{$key.':offsets:'.$newbigstep}= $prevoffset; # one before is the right start
+      $oldbigstep= $newbigstep;
+      }
+    $prevoffset= $offset;
+    $offset= tell(OUTDATF);
+    }
+  return;
+} # sub dumpOffsets
+
+
+
+#***********************************************************
+sub get_zcat { my $fullfile = shift; 
+#***********************************************************
+  if( $fullfile=~/\.gz$/i )
+    {
+    my $zcat= `which zcat`;
+    if( $? != 0 ) { $zcat=`which gzcat`; }
+    chomp($zcat);
+    return($zcat);
+    }
+  elsif( $fullfile=~/\.bz2$/i ) { return('bzcat'); }
+  return('/bin/cat'); 
+} # sub get_zcat
+
+
+
+# eof
