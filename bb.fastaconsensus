@@ -1,0 +1,447 @@
+#!/usr/bin/perl
+#----------------------------------------------------------#
+#        Author: Douglas Senalik dsenalik@wisc.edu         #
+#----------------------------------------------------------#
+# "Black Box" program series
+=bb
+Generate a consensus of a multi-fasta alignment
+=cut bb
+use strict;
+use warnings;
+use Getopt::Long;      # for getting command line parameters
+my $ver="1.0";
+
+
+
+############################################################
+# configuration variables
+############################################################
+my $defaultunknown = '?*-';
+my $defaultwrap = 0;
+my $defaultmajority = 20;
+my %degen = (  # lookup for degenerate bases
+  'A'    => 'A',
+  'AC'   => 'M',
+  'ACG'  => 'V',
+  'ACGNT'=> 'N',
+  'ACGT' => 'N',
+  'ACN'  => 'M',
+  'ACT'  => 'H',
+  'AG'   => 'R',
+  'AGN'  => 'R',
+  'AGT'  => 'D',
+  'AN'   => 'A',
+  'AT'   => 'W',
+  'ANT'  => 'W',
+  'C'    => 'C',
+  'CG'   => 'S',
+  'CGN'  => 'S',
+  'CGT'  => 'B',
+  'CN'   => 'C',
+  'CT'   => 'Y',
+  'CNT'  => 'Y',
+  'G'    => 'G',
+  'GN'   => 'G',
+  'GNT'  => 'K',
+  'GT'   => 'K',
+  'N'    => 'N',
+  'NT'   => 'T',
+  'T'    => 'T' );
+
+
+
+############################################################
+# global variables
+############################################################
+my $ansiup    = "\033[1A";  # terminal control
+(my $prognopath = $0) =~ s/^.*[\/\\]//;
+my @seq; # sequences loaded from $infilename
+my %unk; # unknown base index from $unknown
+my @counts;
+my %allbases;
+
+
+
+############################################################
+# command line parameters
+############################################################
+my $infilename   = "";   # input file name
+my $outfilename  = "";   # output file name
+my $consensusonly;
+my $unknown      = $defaultunknown;
+my $majority     = $defaultmajority;
+my $nodegen      = 0;
+my $wrap         = $defaultwrap;
+my $report;
+my $help         = 0;    # print help and exit
+my $quiet        = 0;    # only show errors
+my $debug        = 0;    # print extra debugging information
+GetOptions (
+            "infile=s"       => \$infilename,        # string
+            "outfile=s"      => \$outfilename,       # string
+            "majority=s"     => \$majority,          # string(real)
+            "nodegenerate"   => \$nodegen,           # flag
+            "consensusonly"  => \$consensusonly,     # flag
+            "report:s"       => \$report,            # flag|filename
+            "unknown=s"      => \$unknown,           # string(char list)
+            "wrap=i"         => \$wrap,              # integer
+            "help"           => \$help,              # flag
+            "quiet"          => \$quiet,             # flag
+            "debug"          => \$debug);            # flag
+# debug implies not quiet
+if ( $debug ) { $quiet = 0; }
+unless ( $infilename ) { $help = 1 }
+unless ( $outfilename ) { $help = 1 }
+if ( $outfilename eq "-" ) { $quiet = 1 }
+
+
+
+############################################################
+# print help screen
+############################################################
+if ( $help )
+  {
+    print "$prognopath version $ver
+
+This program takes an aligned multi-FASTA file as input, and generates
+a consensus sequence based on the most abundant nucleotide
+
+Required parameters:
+  --infile=xxx      input multi-FASTA file name
+  --outfile=xxx     output file name, consensus will be added as the
+                    first sequence
+                    filenames can be .gz compressed, or use - for STDIN/STDOUT
+Optional parameters:
+  --majority=xxx    if second most abundant base is within
+                    this percentage of most abundant, then
+                    generate a degenerate base. Default = $defaultmajority,
+                    use --majority=0 to only select most abundant base
+  --nodegen         do not use degenerate base codes in the consensus
+                    sequence. If equal frequencies, choose one at random
+  --consensusonly   only output the consensus sequence
+  --unknown=xxx     characters representing unknow bases which are ignored
+                    for creating the consensus
+                    default = \"$defaultunknown\"
+  --wrap=xxx        wrap output sequences to this length,
+                    default is no wrap
+  --report[=xxx]    print a summary of base frequencies
+                    optional value is output file name, default is STDOUT
+  --help            print this screen
+  --quiet           only print error messages
+  --debug           print extra debugging information
+";
+    exit 1;
+  } # if ( $help )
+
+
+
+############################################################
+# generate unknown base hash
+############################################################
+for my $i ( 0 .. length($unknown)-1 )
+  { $unk{substr($unknown, $i, 1)} = 1; }
+
+
+
+############################################################
+# load input file
+############################################################
+debugmsg ( "Loading input file \"$infilename\"" );
+@seq = loadfasta ( $infilename, 1 );
+unless ( $quiet ) { print "Loaded ".commify(scalar @seq)." sequences\n"; }
+
+
+
+############################################################
+# main processing loop
+############################################################
+{
+debugmsg ( "Counting bases" );
+foreach my $aseq ( @seq )
+  {
+    for my $i ( 0 .. length($aseq->{seq})-1 )
+      {
+        my $base = substr($aseq->{seq}, $i, 1);
+        unless ( $unk{$base} ) # skip gaps
+          {
+            $counts[$i]->{$base}++;
+            $allbases{$base}++;
+          }
+      }
+  } # for $aseq
+
+debugmsg ( "Generating consensus" );
+my %consseq = ( 'seq' => '', 'hdr' => 'Consensus' );
+for my $i ( 0 .. $#counts )
+  {
+    # rank bases by frequency
+    my @byfreq = sort { $counts[$i]->{$b} <=> $counts[$i]->{$a} } keys %{$counts[$i]};
+
+    ### code for degenerate
+    my $totalbases = 0;
+    foreach my $base ( keys %{$counts[$i]} )
+      { $totalbases += $counts[$i]->{$base}; }
+    my @pct;
+    my @deg;
+    for my $j ( 0 .. 3 )
+      {
+        last unless ( $byfreq[$j] );
+        $pct[$j] = $counts[$i]->{$byfreq[$j]} * 100 / $totalbases;
+        if ( $j == 0 )
+          { push ( @deg, $byfreq[$j] ); }
+        else
+          {
+            if ( ( $pct[$j] + $majority ) >= $pct[0] )
+              { push ( @deg, $byfreq[$j] ); }
+            else
+              { last; }
+          }
+      }
+    my $degenstr = join ( '', sort ( @deg ) );  # alphabetical to simplify degenerate hash
+    if ( $nodegen )
+      {
+        if ( ( $degenstr =~ m/[\?N\-]/ ) and ( substr($degenstr,1,1) !~ m/[\?N\-]/ ))
+          { $degenstr = substr($degenstr,1,1); }
+        else
+          { $degenstr = substr($degenstr,0,1); }
+      }
+    my $db = $degen{uc($degenstr)};
+    unless ( $db )
+      {
+        $db = "N";
+        print "Warning, cannot lookup degenerate base for \"$degenstr\" position $i totalbases=$totalbases, converting to \"N\"\n";
+      }
+    $consseq{seq} .= $db;
+  } # for $i
+unshift ( @seq, \%consseq );
+}
+
+
+
+############################################################
+# save output file
+############################################################
+debugmsg ( "Saving output file \"$outfilename\"" );
+if ( $consensusonly ) { @seq = $seq[0]; }
+savefasta ( $outfilename, \@seq, $wrap );
+
+
+
+############################################################
+# report
+############################################################
+if ( defined $report )
+  {
+    unless ( $report ) { $report = '-'; }
+    my $OUTF = stdopen ( ">", $report );
+    print $OUTF "Pos";
+    for my $base ( sort keys %allbases )
+      { print $OUTF "\t", $base; }
+    print $OUTF "\n";
+    for my $i ( 0 .. $#counts )
+      {
+        print $OUTF $i+1;
+        for my $base ( sort keys %allbases )
+          { print $OUTF "\t", ( $counts[$i]->{$base} // 0 ); }
+        print $OUTF "\n";
+      }
+    stdclose ( $OUTF );
+  }
+
+
+
+############################################################
+# cleanup and end program
+############################################################
+unless ( $quiet ) { print "Done\n"; }
+exit 0;
+
+
+
+############################################################
+sub debugmsg { my ( $text, $noreturn, $nolinenum ) = @_;
+############################################################
+  if ( $debug )
+    {
+      my ($package, $filename, $line, $sub) = caller(0);
+      unless ( $nolinenum ) { $text = "Line $line: " . $text; }
+      if ( ! ( $noreturn ) ) { $text .= "\n"; }
+      print $text;
+    } # if ( $debug )
+} # sub debugmsg
+
+
+
+###############################################################
+sub timestr {
+###############################################################
+  @_ = localtime(shift || time);
+  return(sprintf("%04d/%02d/%02d %02d:%02d", $_[5]+1900, $_[4]+1, $_[3], @_[2,1]));
+} # sub timestr
+
+
+
+###############################################################
+sub commify {
+###############################################################
+# http://perldoc.perl.org/perlfaq5.html#How-can-I-output-my-numbers-with-commas
+  local $_ = shift;
+  1 while s/^([-+]?\d+)(\d{3})/$1,$2/;
+  return $_;
+} # commify
+
+
+
+###############################################################
+sub stdopen { my ( $mode, $filename, $extratext ) = @_;
+###############################################################
+# a replacement for the three-parameter open which also allows
+# the use of "-" as the file name to mean STDIN or STDOUT
+  my $fh;  # the file handle
+  if ( $filename eq "-" )  # only exact match to "-" has special meaning
+    {
+      if ( $mode =~ m/>/ )
+        { $fh = *STDOUT }
+      else
+        { $fh = *STDIN }
+    }
+  else
+    {
+      # supplemental passed text for error messages, need one more space
+      if ( defined $extratext )
+        { $extratext .= " " }
+      else
+        { $extratext = "" }
+
+      my $text;  # this is only used for error message
+      if ( $mode =~ m/^\+?>>/ )  # ">>" or "+>>"
+        { $text = "append" }
+      elsif ( $mode =~ m/^\+?>/ )  # ">" or "+>"
+        { $text = "output" }
+      elsif ( $mode =~ m/^\+?</ )  # "<" or "+<"
+        { $text = "input" }
+      elsif ( $mode eq "-|" )
+        { $text = "piped input" }
+      elsif ( $mode eq "|-" )
+        { $text = "piped output" }
+      else
+        { die "Error, unsupported file mode \"$mode\" specified to stdopen( $mode, $filename, $extratext )\n"; }
+
+      # if file name ends in ".gz", gzip compression is assumed, and handle it transparently
+      if ( $filename =~ m/\.gz$/ )
+        {
+          if ( $mode =~ m/^>$/ ) # output mode
+            { $mode = "|-"; $filename = "gzip -c > \"$filename\""; }
+          elsif ( $mode =~ m/^<$/ ) # input mode
+            { $mode = "-|"; $filename = "gunzip -c \"$filename\""; }
+          else
+            { die "Error, can't handle gzip compression with mode \"$mode\" for file \"filename\"\n"; }
+        } # if gzip compressed file
+      elsif ( $filename	=~ m/\.bz2$/ )
+       	{
+          if ( $mode =~ m/^>$/ ) # output mode
+            { $mode = "|-"; $filename = "bzip2 -c > \"$filename\""; }
+          elsif ( $mode =~ m/^<$/ ) # input mode
+            { $mode = "-|"; $filename = "bunzip2 -c \"$filename\""; }
+          elsif ( $mode =~ m/^>>$/ ) # append mode
+            { $mode = "|-"; $filename = "gzip -c >> \"$filename\""; }
+          else
+            { die "Error, can't handle bzip2 compression with mode \"$mode\" for file \"filename\"\n"; }
+       	}
+      open ( $fh, $mode, $filename ) or die ( "Error opening ${extratext}file \"$filename\" for $text: $!\n" );
+    }
+  # return the opened file handle to the caller
+  return $fh;
+} # sub stdopen
+
+
+
+###############################################################
+sub stdclose { my ( $fh ) = @_;
+###############################################################
+# same as built-in close, except in case of STDIN or STDOUT,
+# and in this case the file handle is not closed
+
+  unless ( fileno($fh) <= 2 )  # if file number is this low, is stdin or stdout or stderr
+    { close ( $fh ) or die ( "Error closing file handle: $!\n" ); }
+
+} # sub stdclose
+
+
+
+###############################################################
+sub loadfasta { my ( $infilename, $stripreturns ) = @_;
+###############################################################
+# load a single FASTA file into an array of hashes to separate header and sequence portion
+# e.g. $seq[3]->{hdr} contains the header of the fourth sequence, $seq[3]->{seq} contains the sequence
+# and the ">" is stripped off of the header
+  my @seq;
+  my $count = 0;  # number of sequences loaded
+  my $mode = "<";
+  if ( $infilename =~ m/\.gz$/ )
+    { $mode = "-|"; $infilename = "gunzip -c \"$infilename\""; }
+  my $INF = stdopen ( $mode, $infilename, 'input FASTA' );
+  while ( my $aline = <$INF> )
+    {
+      if ( $aline =~ m/^#/ ) # ignore comment lines
+       	{  }
+      elsif ( $aline =~ m/^>(.*)$/ )
+        {
+          $aline =~ s/[\r\n]//g;
+          $aline =~ s/^>//;
+          $count++;
+          $seq[$count-1]->{hdr} = $aline;
+        }
+      else
+        {
+          if ( $stripreturns ) { $aline =~ s/[\r\n]//g; }
+          $seq[$count-1]->{seq} .= $aline;
+        }
+    } # while ( my $aline = <$INF> )
+  stdclose ( $INF );
+  return @seq;
+} # sub loadfasta
+
+
+
+###############################################################
+sub savefasta { my ( $outfilename, $arrayref, $addreturns ) = @_;
+###############################################################
+  # save a FASTA file in a hash as described by loadfasta above
+  # addreturns is the desired wrap length, or undefined or zero for no wrapping
+  my $OUTF = stdopen ( ">", $outfilename, 'output FASTA' );
+  foreach my $seqref ( @{$arrayref} )
+    {
+      next unless ( defined $seqref );
+      print $OUTF ">", $seqref->{"hdr"}, "\n";
+      my $s = $seqref->{"seq"};
+      if ( $addreturns )
+        { $s =~ s/(.{$addreturns})/$1\n/g; }
+      print $OUTF $s;
+      unless ( $s =~ m/\n$/ ) {	print $OUTF "\n"; }
+    } # foreach my $seqref ( @{$arrayref} )
+  stdclose ( $OUTF );
+} # sub savefasta
+
+
+
+###############################################################
+sub indexfasta { my ( $seqref, $stripheaders ) = @_;
+###############################################################
+# if $stripheaders is true, remove anything in header after
+# the first white space. Returns a hash reference, key is
+# header, value is array index
+  my %index;
+  for my $i ( 0..$#{$seqref} )
+    {
+      my $hdr = $seqref->[$i]->{'hdr'};
+      if ( $stripheaders ) { $hdr =~ s/\s.*$//; }
+      if ( defined $index{$hdr} ) { die "Error, duplicate header \"$hdr\" while indexing\n"; }
+      $index{$hdr} = $i;
+    }
+  return \%index
+} # sub indexfasta
+
+
+
+# eof

@@ -72,6 +72,12 @@ This program collects and parses output from a Shimadzu ELSD-LT, which is
 an Evaporative Light-scattering Detector, Low Temperature,
 (original version circa 2002+) as collected from its RS232 serial port
 
+bb.fastaconsensus
+------------
+
+This program takes an aligned multi-FASTA file as input, and generates
+a consensus sequence based on the most abundant nucleotide.
+
 bb.fastagrep
 ------------
 
