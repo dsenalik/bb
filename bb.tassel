@@ -1,0 +1,317 @@
+#!/usr/bin/perl
+#----------------------------------------------------------#
+#        Author: Douglas Senalik dsenalik@wisc.edu         #
+#             https://github.com/dsenalik/bb               #
+#----------------------------------------------------------#
+# "Black Box" program series
+=bb
+Add barcodes to reverse reads for Tassel pipeline
+=cut bb
+use strict;
+use warnings;
+use Getopt::Long;      # for getting command line parameters
+
+
+
+############################################################
+# configuration variables
+############################################################
+my $defaultoffset = 0; #useless
+my @defaultoverhangs = ( "CAGC", "CTGC" );  # ApeKI
+
+
+
+############################################################
+# global variables
+############################################################
+my $ansiup    = "\033[1A";  # terminal control
+(my $prognopath = $0) =~ s/^.*[\/\\]//;
+my @bch;  # array of hashes for looking up barcode hits
+my $overhanglength;
+
+
+
+############################################################
+# command line parameters
+############################################################
+my $finfilename  = "";   # input file name
+my $rinfilename  = "";   # input file name
+my $outfilename  = "";   # output file name
+my $offset       = $defaultoffset; #useless
+my @overhangs;
+my $help         = 0;    # print help and exit
+my $quiet        = 0;    # only show errors
+my $debug        = 0;    # print extra debugging information
+GetOptions (
+            "finfile=s"      => \$finfilename,       # string
+            "rinfile=s"      => \$rinfilename,       # string
+            "outfile=s"      => \$outfilename,       # string
+            "offset=i"       => \$offset,            # string # useless
+            "overhang=s"     => \@overhangs,         # string
+            "help"           => \$help,              # flag
+            "quiet"          => \$quiet,             # flag
+            "debug"          => \$debug);            # flag
+# debug implies not quiet
+if ( $debug ) { $quiet = 0; }
+if ( ( $finfilename ) or ( $rinfilename ) or ( $outfilename ) )
+  {
+    unless ( $finfilename ) { print "Error, --finfile not specified\n"; $help = 1; }
+    unless ( $rinfilename ) { print "Error, --rinfile not specified\n"; $help = 1; }
+    unless ( $outfilename ) { print "Error, --outfile not specified\n"; $help = 1; }
+  }
+else
+  { $help = 1; }
+unless ( @overhangs ) { @overhangs = @defaultoverhangs; }
+if ( $outfilename eq "-" ) { $quiet = 1 }
+
+
+
+############################################################
+# print help screen
+############################################################
+if ( $help )
+  {
+    print "$prognopath
+This program will preprocess paired-end Illumina reads from
+GBS (Genotyping By Sequencing) experiments to make them
+compatible with TASSEL. This involves copying the barcode
+from the forward reads to the beginning of the reverse reads,
+since TASSEL cannot otherwise identify the reverse reads which
+do not have a barcode.
+
+Required parameters:
+  --finfile=xxx     input FASTQ file name of forward reads,
+                    can be gzip compressed if .gz extension
+  --rinfile=xxx     input FASTQ file name of reverse reads,
+  --outfile=xxx     output file name, compressed if .gz extension
+                    or use - for STDOUT
+Optional parameters:
+  --overhang=xxx    sequence(s) of restriction enzyme
+                    overhang, e.g. for ApeKI (this is the
+                    default), use --overhang twice:
+                    --overhang=CAGC --overhang=CTGC
+                    they must all be the same length
+  --help            print this screen
+  --quiet           only print error messages
+  --debug           print extra debugging information
+";
+    exit 1;
+  } # if ( $help )
+
+# Removed this option, it was added but
+# is not really useful at all # useless
+#  --offset=xxx      Ignore this many bases at the start of
+#                    the read, default = $defaultoffset
+
+
+
+############################################################
+# initialization
+############################################################
+init();
+
+
+
+############################################################
+# Process reads
+############################################################
+my $FINF = stdopen ( "<", $finfilename );
+my $RINF = stdopen ( "<", $rinfilename );
+my $FOUTF = stdopen ( ">", $outfilename );
+my $ROUTF = $FOUTF;  # for future, in case want non-interleaved file
+my $nfound = 0;
+my $nnotfound = 0;
+while ( ! eof $FINF )
+  {
+    my @flines;
+    my @rlines;
+    # no error checking here in case either file ends prematurely
+    for my $i ( 0..3 )
+      {
+        ( $flines[$i] = <$FINF> ) =~ s/[\r\n]//g;
+        ( $rlines[$i] = <$RINF> ) =~ s/[\r\n]//g;
+      }
+
+    # find barcode
+    my $bclength;
+    for my $i ( 8, 7, 6, 5, 4 )
+      {
+
+        if ( $bch[$i]->{substr($flines[1],$offset,$i+4-$offset)} )
+          {
+            $bclength = $i;
+            last;
+          }
+      }
+
+    # add barcode to reverse read. Reverse read should already have enzyme site
+    if ( $bclength )
+      {
+        $nfound++;
+        substr($rlines[1],$offset,0) = substr($flines[1],$offset,$bclength);
+        substr($rlines[3],$offset,0) = substr($flines[3],$offset,$bclength);
+
+        # save to interleaved file
+        for my $i ( 0..3 )
+          { print $FOUTF $flines[$i], "\n"; }
+        for my $i ( 0..3 )
+          { print $ROUTF $rlines[$i], "\n"; }
+      }
+    else # forward read lacking any known barcode+enzyme, discard both F and R reads
+      { $nnotfound++; }
+
+  } # while <$INF>
+stdclose ( $FOUTF );
+stdclose ( $RINF );
+stdclose ( $FINF );
+unless ( $quiet ) { print "Found " . commify($nfound) . " read pairs with barcodes, "
+                    . commify($nnotfound) . " pairs without barcodes discarded\n"; }
+
+
+
+############################################################
+# cleanup and end program
+############################################################
+exit 0;
+
+
+
+############################################################
+sub init {
+############################################################
+# initialize barcode array of hashes @bch from list of barcodes
+# the order of barcodes with @bc is not important
+# initializes global variables $overhanglength and @bch
+
+my @bc = qw / AACCGAGA ACAGGGAA ACGACTAC ACGTGGTA CCATGGGT CCGGATAT CGCCTTAT CGCGGAGA CGTGTGGT
+              GCTGTGGA GGATTGGT GTGAGGGT TAGCATGC TAGGCCAT TATCGGGA TCTCAGTC TGCAAGGA TGGTACGT TTCCTGGA
+              AAAAGTT AACGCCT AATATGC ACGTGTT ATGAAAC ATTAATT ATTGGAT CATAAGT CGCTGAT CGGTAGA CTACGGA
+              CTTGCTT GAACTTC GAATTCA GCGGAAT GGACCTA GTCGATT TAGCGGA TATTTTT TCGAAGA TCTGTGA TGCTGGA
+              ACCTAA AGTGGA ATATGT ATCGTA ATGCCT CATCGT CCACAA CCAGCT CGCGGT CTATTA CTTCCA
+              GAGATA GCCAGT GCTCTA GGAAGA GGTTGT GTACTT GTTGAA TAACGA TAGGAA TGGCTA TTCAGA
+              ACAAA ACCGT AGCCC AGGAT ATTGA CATCT CCTAC CGCTT CTAGC CTGTA GAGGA
+              GCTTA GGAAC GGTGT GTATT GTCAA TAATA TACAT TCACC TCGTT TGCGA TTCTC
+              AACT ACTA AGGC CAGA CGAT CTCC GATC GCGT GTAA TCAC TGCA /;
+
+  # check that all --overhang parameters are the same length
+  $overhanglength = length($overhangs[0]);
+  foreach my $overhang ( @overhangs )
+    {
+      if ( length($overhang) != $overhanglength )
+        { die "Error, all overhang sequences must be the same length\n"; }
+    }
+
+  # initialize @bch barcode+enzyme lookup hashes
+  foreach my $abarcode ( @bc )
+    {
+      my $l = length($abarcode);
+      $abarcode = substr($abarcode,$offset);  # if skipping first base # useless
+      foreach my $overhang ( @overhangs )
+        { $bch[$l]->{ $abarcode . uc($overhang) } = 1; }
+    }
+
+} # sub init
+
+
+
+############################################################
+sub debugmsg { my ( $text, $noreturn, $nolinenum ) = @_;
+############################################################
+  if ( $debug )
+    {
+      my ($package, $filename, $line, $sub) = caller(0);
+      unless ( $nolinenum ) { $text = "Line $line: " . $text; }
+      if ( ! ( $noreturn ) ) { $text .= "\n"; }
+      print $text;
+    } # if ( $debug )
+} # sub debugmsg
+
+
+
+###############################################################
+sub timestr {
+###############################################################
+  @_ = localtime(shift || time);
+  return(sprintf("%04d/%02d/%02d %02d:%02d", $_[5]+1900, $_[4]+1, $_[3], @_[2,1]));
+} # sub timestr
+
+
+
+###############################################################
+sub commify {
+###############################################################
+# http://perldoc.perl.org/perlfaq5.html#How-can-I-output-my-numbers-with-commas
+  local $_ = shift;
+  1 while s/^([-+]?\d+)(\d{3})/$1,$2/;
+  return $_;
+} # commify
+
+
+
+###############################################################
+sub stdopen { my ( $mode, $filename, $extratext ) = @_;
+###############################################################
+# a replacement for the three-parameter open which also allows
+# the use of "-" as the file name to mean STDIN or STDOUT
+  my $fh;  # the file handle
+  if ( $filename eq "-" )  # only exact match to "-" has special meaning
+    {
+      if ( $mode =~ m/>/ )
+        { $fh = *STDOUT }
+      else
+        { $fh = *STDIN }
+    }
+  else
+    {
+      # supplemental passed text for error messages, need one more space
+      if ( defined $extratext )
+        { $extratext .= " " }
+      else
+        { $extratext = "" }
+
+      my $text;  # this is only used for error message
+      if ( $mode =~ m/^\+?>>/ )  # ">>" or "+>>"
+        { $text = "append" }
+      elsif ( $mode =~ m/^\+?>/ )  # ">" or "+>"
+        { $text = "output" }
+      elsif ( $mode =~ m/^\+?</ )  # "<" or "+<"
+        { $text = "input" }
+      elsif ( $mode eq "-|" )
+        { $text = "piped input" }
+      elsif ( $mode eq "|-" )
+        { $text = "piped output" }
+      else
+        { die "Error, unsupported file mode \"$mode\" specified to stdopen( $mode, $filename, $extratext )\n"; }
+
+      # if file name ends in ".gz", gzip compression is assumed, and handle it transparently
+      if ( $filename =~ m/\.gz$/ )
+        {
+          if ( $mode =~ m/^>$/ ) # output mode
+            { $mode = "|-"; $filename = "gzip -9 -c > \"$filename\""; }
+          elsif ( $mode =~ m/^<$/ ) # input mode
+            { $mode = "-|"; $filename = "gunzip -c \"$filename\""; }
+          else
+            { die "Error, can't handle gzip compression with mode \"$mode\" for file \"filename\"\n"; }
+        } # if gzip compressed file
+      open ( $fh, $mode, $filename ) or die ( "Error opening ${extratext}file \"$filename\" for $text: $!\n" );
+    }
+  # return the opened file handle to the caller
+  return $fh;
+} # sub stdopen
+
+
+
+###############################################################
+sub stdclose { my ( $fh ) = @_;
+###############################################################
+# same as built-in close, except in case of STDIN or STDOUT,
+# and in this case the file handle is not closed
+
+  unless ( fileno($fh) <= 2 )  # if file number is this low, is stdin or stdout or stderr
+    { close ( $fh ) or die ( "Error closing file handle: $!\n" ); }
+
+} # sub stdclose
+
+
+
+# eof

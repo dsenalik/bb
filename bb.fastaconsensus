@@ -334,6 +334,8 @@ sub stdopen { my ( $mode, $filename, $extratext ) = @_;
             { $mode = "|-"; $filename = "gzip -c > \"$filename\""; }
           elsif ( $mode =~ m/^<$/ ) # input mode
             { $mode = "-|"; $filename = "gunzip -c \"$filename\""; }
+          elsif ( $mode =~ m/^>>$/ ) # append mode
+            { $mode = "|-"; $filename = "gzip -c >> \"$filename\""; }
           else
             { die "Error, can't handle gzip compression with mode \"$mode\" for file \"filename\"\n"; }
         } # if gzip compressed file
@@ -343,8 +345,6 @@ sub stdopen { my ( $mode, $filename, $extratext ) = @_;
             { $mode = "|-"; $filename = "bzip2 -c > \"$filename\""; }
           elsif ( $mode =~ m/^<$/ ) # input mode
             { $mode = "-|"; $filename = "bunzip2 -c \"$filename\""; }
-          elsif ( $mode =~ m/^>>$/ ) # append mode
-            { $mode = "|-"; $filename = "gzip -c >> \"$filename\""; }
           else
             { die "Error, can't handle bzip2 compression with mode \"$mode\" for file \"filename\"\n"; }
        	}

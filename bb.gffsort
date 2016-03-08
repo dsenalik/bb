@@ -78,6 +78,7 @@ Required parameters:
                     file are saved to the output file
   --outfile=xxx     output file name, use \"-\" for stdout
                     gzipped with \".gz\" extension okay
+                    --outfile can be the same as --infile
 
 Optional parameters:
   --keyfile=xxx     instead of sorting alphabetically, sort to the
