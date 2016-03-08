@@ -145,6 +145,16 @@ This program will return all portions of a final assembly consisting of
 contiguous sequence, with sequences split at every occurrence of gaps of
 unknown bases (Ns)
 
+bb.tassel
+---------
+
+This program will preprocess paired-end Illumina reads from
+GBS (Genotyping By Sequencing) experiments to make them
+compatible with TASSEL. This involves copying the barcode
+from the forward reads to the beginning of the reverse reads,
+since TASSEL cannot otherwise identify the reverse reads which
+do not have a barcode.
+
 bb.timestamper
 --------------
 
