@@ -102,6 +102,15 @@ from the 454 GS FLX sequencing platform
 [Plant Methods 2011, 7:38](http://www.plantmethods.com/content/7/1/38) doi:10.1186/1746-4811-7-38
 [Additional file 1](http://www.plantmethods.com/content/supplementary/1746-4811-7-38-s1.doc)
 
+bb.gapcoder
+-----------
+
+Implements gap coding of an aligned multi-fasta file as described in
+BMC Bioinformatics 2003 4:6 "GapCoder automates the use of indel
+characters in phylogenetic analysis"
+http://bmcbioinformatics.biomedcentral.com/articles/10.1186/1471-2105-4-6
+This program generates a tab-delimited matrix output format
+
 bb.gffsort
 ---------------
 

@@ -14,6 +14,7 @@ use Getopt::Long;      # for getting command line parameters
 # Version 1.1 September 3, 2011 - Add subrange feature to --seq
 #                                 Modify to work with scaffolds also
 # Version 1.2 August 21, 2014   - Add --spacer flag
+# Version 1.3 April 5, 2016     - Add --gff and --keyforgff, now supports .gz compression
 
 
 
@@ -61,6 +62,8 @@ my $globalprefix = $defaultglobalprefix;
 my $help        = 0;    # print help and exit
 my $oneseq;             # to concatenate all sequences, and optional header
 my $spacer;             # N spacer length when using --onesequence
+my $gff;                # use a gff3 file to obtain sequences and coordinates
+my $keyforgff;          # use only these features (column#3) from the gff3 file
 my $annotate    = 0;    # extra information in header
 my $startstop   = 0;    # put start and stop coordinates in file
 my $noqual      = 0;    # do not attempt to include qual file
@@ -82,6 +85,8 @@ GetOptions (
             "sequence=s"     => \@seq,               # string array
             "exclude=s"      => \@exclude,           # string array
             "onesequence:s"  => \$oneseq,            # flag/string
+            "gff:s"          => \$gff,               # string(filename)
+            "keyforgff:s"    => \$keyforgff,         # string
             "spacer:s"       => \$spacer,            # flag/string
             "prefix:s"       => \$globalprefix,      # flag/string
             "annotate"       => \$annotate,          # flag
@@ -101,7 +106,8 @@ GetOptions (
             "debug"          => \$debug);            # flag
 unless ( scalar @infilenames ) { $help = 1; }
 unless ( $outfilename ) { $help = 1; }
-if ( ( ( scalar @seq ) + ( scalar @exclude ) + $random ) < 1 ) { $help = 1; }
+if ( ( ( ( scalar @seq ) + ( scalar @exclude ) + $random ) < 1 ) and ( ! $gff ) )
+  { $help = 1; }
 if ( ( defined $wrap ) and ( $wrap == 0 ) ) { $wrap = $defaultwrap; }
 if ( $outfilename eq '-' ) { $quiet = 1; }
 # debug implies not quiet
@@ -124,7 +130,7 @@ Required parameters:
   --outfile=xxx     output file name, or \"-\" for stdout
   --seq=xxx         sequences to keep, multiple allowed, a plus
                     \"+\" for forward orientation is optional, 
-                    or use \"-\" anywhere to indicate reverse
+                    or use \"-\" before the : to indicate reverse
                     complement. Use \"..\" to indicate a range.
                     Use \",\" to separate entries. Examples:
                     --seq=contig45 --seq=46,49,-21..23
@@ -141,7 +147,7 @@ Required parameters:
                     --seq=xx:-100 returns the last 100 b.p.
                     1:-1 is the whole string, -1:-1 is the last char
                     The --seq parameter may be omitted if --exclude
-                    or --random is used instead
+                    --random or --gff are used instead
 Optional parameters:
   --prefix[=xxx]    if --seq uses only a number, this text will be
                     prefixed to the contig name. Default value = \"$defaultglobalprefix\"
@@ -151,6 +157,10 @@ Optional parameters:
                     unchanged from the original file in this case.
   --random=xxx      return this many sequences selected at random
                     and placed in random order
+  --gff=xxx         instead of using --seq, use this gff3 format file to
+                    obtain sequences and coordinates
+  --keyforgff=xxx   use only lines with this gff3 feature (column #3)
+                    e.g. \"gene\" or \"rRNA\"
   --coordinates=xxx create this additional output file, which has
                     the starting and ending position of each contig
   --lifttable=xxx   create a lift table compatible with --bb.liftgff,
@@ -192,6 +202,14 @@ Optional parameters:
 ############################################################
 # expand ranges in specified sequences
 ############################################################
+# load any --seq from the -gff parameter
+if ( $gff )
+  {
+    my @gffdata = loadtsv( $gff );
+    my @gffseq = convertgfftoseq( \@gffdata, $keyforgff );
+    push( @seq, @gffseq );
+  }
+
 @seq = expandseq ( "--seq", @seq );
 @exclude = expandseq ( "--exclude", @exclude );
 
@@ -234,12 +252,13 @@ foreach my $infilename ( @infilenames )
           }
         else
           {
+            unless ( $currkey ) { die "Error, no current key, maybe this is not a fasta file. line $nlines=\"$aline\"\n"; }
             $inseq{$currkey} .= $aline;  # retains newlines
           }
       } # while <$INF>
     stdclose ( $INF );
     unless ( $quiet )
-      { print "Input file read, " . commify($nlines) . " lines, " . commify($nheaders) . " sequences\n"; }
+      { print "Input file \"$infilename\" read, " . commify($nlines) . " lines, " . commify($nheaders) . " sequences\n"; }
 
 
 
@@ -737,6 +756,58 @@ else
 
 
 ############################################################
+sub loadtsv { my ( $infilename, $delimiter ) = @_;
+############################################################
+# load a tab-delimited text file and return as a 2d array
+# global variable $quiet controls verbosity
+  my @data;
+  $delimiter //= "\t";  # defaults to tab delimited
+  unless ( $quiet ) { print "Loading \"$infilename\"  ".timestr()."\n"; }
+  my $INF = stdopen( "<", $infilename );
+  my $nlines = 0;
+  my $ncells = 0;
+  while ( my $aline = <$INF> )
+    {
+      $nlines++;
+      $aline =~ s/[\r\n]//g;
+      my @cols = split( /$delimiter/, $aline );
+      push( @data, \@cols );
+      $ncells += scalar( @cols );
+    }
+  stdclose( $INF );
+  unless ( $quiet )
+    { print "Loaded ".commify($nlines)." lines, ".commify($ncells)." cells\n"; }
+  return( @data );
+} # sub loadtsv
+
+
+
+############################################################
+sub convertgfftoseq { my ( $dataref, $col3match ) = @_;
+############################################################
+# converts a gff3 file loaded with loadtsv() into a structure
+# to replicate the --seq parameter information
+  my @seqinfo;
+  my $nqueries = 0;
+  foreach my $rowref ( @$dataref )
+    {
+      next unless ( $rowref->[0] );
+      next if ( $rowref->[0] =~ m/^#/ );
+      next if ( ( $col3match ) and ( $rowref->[2] ne $col3match ) );
+      my $query = $rowref->[0];
+      if ( $rowref->[6] eq '-' ) { $query .= '-'; }
+      $query .= ':' . $rowref->[3] . ':' . $rowref->[4];
+      push( @seqinfo, $query );
+      debugmsg( "gff query \"$query\" added" );
+      $nqueries++;
+    }
+  unless ( $quiet ) { print "Loaded ".commify($nqueries)." sequence queries from gff file\n"; }
+  return @seqinfo;
+} # sub convertgfftoseq
+
+
+
+############################################################
 sub replacewith { my ( $text ) = @_;
 ############################################################
   if ( defined $replace )
@@ -933,13 +1004,39 @@ sub stdopen { my ( $mode, $filename, $extratext ) = @_;
         { $text = "output" }
       elsif ( $mode =~ m/^\+?</ )  # "<" or "+<"
         { $text = "input" }
+      elsif ( $mode eq "-|" )
+        { $text = "piped input" }
+      elsif ( $mode eq "|-" )
+        { $text = "piped output" }
       else
         { die "Error, unsupported file mode \"$mode\" specified to stdopen( $mode, $filename, $extratext )\n"; }
+
+      # if file name ends in ".gz", gzip compression is assumed, and handle it transparently
+      if ( $filename =~ m/\.gz$/ )
+        {
+          if ( $mode =~ m/^>$/ ) # output mode
+            { $mode = "|-"; $filename = "gzip -c > \"$filename\""; }
+          elsif ( $mode =~ m/^<$/ ) # input mode
+            { $mode = "-|"; $filename = "gunzip -c \"$filename\""; }
+          elsif ( $mode =~ m/^>>$/ ) # append mode
+            { $mode = "|-"; $filename = "gzip -c >> \"$filename\""; }
+          else
+            { die "Error, can't handle gzip compression with mode \"$mode\" for file \"filename\"\n"; }
+        } # if gzip compressed file
+      elsif ( $filename	=~ m/\.bz2$/ )
+       	{
+          if ( $mode =~ m/^>$/ ) # output mode
+            { $mode = "|-"; $filename = "bzip2 -c > \"$filename\""; }
+          elsif ( $mode =~ m/^<$/ ) # input mode
+            { $mode = "-|"; $filename = "bunzip2 -c \"$filename\""; }
+          else
+            { die "Error, can't handle bzip2 compression with mode \"$mode\" for file \"filename\"\n"; }
+       	}
       open ( $fh, $mode, $filename ) or die ( "Error opening ${extratext}file \"$filename\" for $text: $!\n" );
     }
   # return the opened file handle to the caller
   return $fh;
-} # stdopen
+} # sub stdopen
 
 
 

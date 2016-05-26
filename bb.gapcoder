@@ -1,0 +1,312 @@
+#!/usr/bin/perl
+#----------------------------------------------------------#
+#        Author: Douglas Senalik dsenalik@wisc.edu         #
+#----------------------------------------------------------#
+# "Black Box" program series
+=bb
+Code gaps in aligned multi-fasta file
+=cut bb
+# Implements gap coding of an aligned multi-fasta file as described in
+# BMC Bioinformatics 2003 4:6 "GapCoder automates the use of indel
+# characters in phylogenetic analysis"
+# http://bmcbioinformatics.biomedcentral.com/articles/10.1186/1471-2105-4-6
+# This program generates a tab-delimited matrix output format
+use strict;
+use warnings;
+use Getopt::Long;      # for getting command line parameters
+
+
+
+############################################################
+# configuration variables
+############################################################
+
+
+
+############################################################
+# global variables
+############################################################
+my $ansiup    = "\033[1A";  # terminal control
+(my $prognopath = $0) =~ s/^.*[\/\\]//;
+
+
+
+############################################################
+# command line parameters
+############################################################
+my $infilename   = "";   # input file name, multi-fasta
+my $outfilename  = "";   # output file name, tab-delimited
+my $number;              # include sequential gap number column in output
+my $help         = 0;    # print help and exit
+my $quiet        = 0;    # only show errors
+my $debug        = 0;    # print extra debugging information
+GetOptions (
+            "infile=s"       => \$infilename,        # string
+            "outfile=s"      => \$outfilename,       # string
+            "number"         => \$number,            # flag
+            "help"           => \$help,              # flag
+            "quiet"          => \$quiet,             # flag
+            "debug"          => \$debug);            # flag
+# debug implies not quiet
+if ( $debug ) { $quiet = 0; }
+unless ( $infilename ) { $help = 1 }
+unless ( $outfilename ) { $help = 1 }
+if ( $outfilename eq "-" ) { $quiet = 1 }
+
+
+
+############################################################
+# print help screen
+############################################################
+if ( $help )
+  {
+    print "$prognopath
+Implements gap coding of an aligned multi-fasta file as described in
+BMC Bioinformatics 2003 4:6 \"GapCoder automates the use of indel
+characters in phylogenetic analysis\"
+http://bmcbioinformatics.biomedcentral.com/articles/10.1186/1471-2105-4-6
+This program generates a tab-delimited matrix output format
+Gap character is \"-\" or \"~\"
+
+Required parameters:
+  --infile=xxx      input aligned multi-fasta file name
+  --outfile=xxx     output file name, tab-delimited
+Optional parameters:
+  --number          include a line number in output
+  --help            print this screen
+  --quiet           only print error messages
+  --debug           print extra debugging information
+";
+    exit 1;
+  } # if ( $help )
+
+
+
+############################################################
+# main
+############################################################
+unless( $quiet ) { print "Loading sequences from input file \"$infilename\"  ".timestr()."\n"; }
+my @seq = loadfasta( $infilename, 1 );  # load without returns
+unless ( $quiet ) { print "Loaded ".commify(scalar @seq)." sequences, detecting gaps  ".timestr()."\n"; }
+
+my %gaps;  # key is start, second key is end, value is array of sequence indices
+my @headers;  # headers up to first white space
+my $totgaps = 0;
+
+for my $i ( 0..$#seq )
+  {
+    ( $headers[$i] = $seq[$i]->{hdr} ) =~ s/ .*$//;
+    debugmsg( "Starting sequence $i header $headers[$i]" );
+    my $ngaps = 0;
+    while ( $seq[$i]->{seq} =~ m/[-~]+/g )
+      {
+        # use magic variables to find start and end, 1-based
+        my $start = $-[0] + 1;
+        my $end = $+[0];
+        $gaps{$start}->{$end}->[$i] = 1;
+        $ngaps++;
+        $totgaps++;
+      }
+    unless( $quiet ) { print "Sequence $i \"$headers[$i]\" found ".commify($ngaps)." gaps\n"; }
+  } # for $i
+unless ( $quiet ) { print "Found a total of ".commify($totgaps)." gaps  ".timestr()."\n"; }
+my $OUTF = stdopen ( ">", $outfilename );
+
+# header line
+if ( $number ) { print $OUTF "gap#\t"; }
+print $OUTF join( "\t", 'gapstart', 'gapend', 'length', 'count' );
+foreach my $hdr ( @headers )
+  { print $OUTF "\t", $hdr; }
+print $OUTF "\n";
+
+my $nlines = 0;
+for my $start ( sort {$a<=>$b} keys %gaps )
+  {
+    for my $end ( sort {$a<=>$b} keys %{$gaps{$start}} )
+      {
+        $nlines++;
+        my $length = $end - $start + 1;
+        my $n = 0;
+        my @cols;
+        for my $i ( 0..$#seq )
+          {
+            if ( $gaps{$start}->{$end}->[$i] )
+              { $n++; $cols[$i] = 1; }
+            else
+              { $cols[$i] = ''; }
+          }
+        if ( $number ) { print $OUTF "$nlines\t"; }
+        print $OUTF join( "\t", $start, $end, $length, $n, @cols ), "\n";
+      }
+  } # for $i
+stdclose ( $OUTF );
+
+
+
+############################################################
+# cleanup and end program
+############################################################
+unless ( $quiet ) { print "$0 Done  ".timestr()."\n"; }
+exit 0;
+
+
+
+############################################################
+sub debugmsg { my ( $text, $noreturn, $nolinenum ) = @_;
+############################################################
+  if ( $debug )
+    {
+      my ($package, $filename, $line, $sub) = caller(0);
+      unless ( $nolinenum ) { $text = "Line $line: " . $text; }
+      if ( ! ( $noreturn ) ) { $text .= "\n"; }
+      print $text;
+    } # if ( $debug )
+} # sub debugmsg
+
+
+
+###############################################################
+sub timestr {
+###############################################################
+  @_ = localtime(shift || time);
+  return(sprintf("%04d/%02d/%02d %02d:%02d", $_[5]+1900, $_[4]+1, $_[3], @_[2,1]));
+} # sub timestr
+
+
+
+###############################################################
+sub commify {
+###############################################################
+# http://perldoc.perl.org/perlfaq5.html#How-can-I-output-my-numbers-with-commas
+  local $_ = shift;
+  1 while s/^([-+]?\d+)(\d{3})/$1,$2/;
+  return $_;
+} # commify
+
+
+
+###############################################################
+sub stdopen { my ( $mode, $filename, $extratext ) = @_;
+###############################################################
+# a replacement for the three-parameter open which also allows
+# the use of "-" as the file name to mean STDIN or STDOUT
+  my $fh;  # the file handle
+  if ( $filename eq "-" )  # only exact match to "-" has special meaning
+    {
+      if ( $mode =~ m/>/ )
+        { $fh = *STDOUT }
+      else
+        { $fh = *STDIN }
+    }
+  else
+    {
+      # supplemental passed text for error messages, need one more space
+      if ( defined $extratext )
+        { $extratext .= " " }
+      else
+        { $extratext = "" }
+
+      my $text;  # this is only used for error message
+      if ( $mode =~ m/^\+?>>/ )  # ">>" or "+>>"
+        { $text = "append" }
+      elsif ( $mode =~ m/^\+?>/ )  # ">" or "+>"
+        { $text = "output" }
+      elsif ( $mode =~ m/^\+?</ )  # "<" or "+<"
+        { $text = "input" }
+      elsif ( $mode eq "-|" )
+        { $text = "piped input" }
+      elsif ( $mode eq "|-" )
+        { $text = "piped output" }
+      else
+        { die "Error, unsupported file mode \"$mode\" specified to stdopen( $mode, $filename, $extratext )\n"; }
+
+      # if file name ends in ".gz", gzip compression is assumed, and handle it transparently
+      if ( $filename =~ m/\.gz$/ )
+        {
+          if ( $mode =~ m/^>$/ ) # output mode
+            { $mode = "|-"; $filename = "gzip -c > \"$filename\""; }
+          elsif ( $mode =~ m/^<$/ ) # input mode
+            { $mode = "-|"; $filename = "gunzip -c \"$filename\""; }
+          else
+            { die "Error, can't handle gzip compression with mode \"$mode\" for file \"filename\"\n"; }
+        } # if gzip compressed file
+      elsif ( $filename	=~ m/\.bz2$/ )
+       	{
+          if ( $mode =~ m/^>$/ ) # output mode
+            { $mode = "|-"; $filename = "bzip2 -c > \"$filename\""; }
+          elsif ( $mode =~ m/^<$/ ) # input mode
+            { $mode = "-|"; $filename = "bunzip2 -c \"$filename\""; }
+          else
+            { die "Error, can't handle bzip2 compression with mode \"$mode\" for file \"filename\"\n"; }
+       	}
+      open ( $fh, $mode, $filename ) or die ( "Error opening ${extratext}file \"$filename\" for $text: $!\n" );
+    }
+  # return the opened file handle to the caller
+  return $fh;
+} # sub stdopen
+
+
+
+###############################################################
+sub stdclose { my ( $fh ) = @_;
+###############################################################
+# same as built-in close, except in case of STDIN or STDOUT,
+# and in this case the file handle is not closed
+
+  unless ( fileno($fh) <= 2 )  # if file number is this low, is stdin or stdout or stderr
+    { close ( $fh ) or die ( "Error closing file handle: $!\n" ); }
+
+} # sub stdclose
+
+
+
+###############################################################
+sub loadfasta { my ( $infilename, $stripreturns ) = @_;
+###############################################################
+# load a single FASTA file into an array of hashes to separate header and sequence portion
+# e.g. $seq[3]->{hdr} contains the header of the fourth sequence, $seq[3]->{seq} contains the sequence
+# and the ">" is stripped off of the header
+  my @seq;
+  my $count = 0;  # number of sequences loaded
+  my $INF = stdopen( '<', $infilename );
+  while ( my $aline = <$INF> )
+    {
+      if ( $aline =~ m/^>(.*)$/ )
+        {
+          $aline =~ s/[\r\n]//g;
+          $aline =~ s/^>//;
+          $count++;
+          $seq[$count-1]->{hdr} = $aline;
+        }
+      else
+        {
+          if ( $stripreturns ) { $aline =~ s/[\r\n]//g; }
+          $seq[$count-1]->{seq} .= $aline;
+        }
+    } # while ( my $aline = <$INF> )
+  stdclose( $INF );
+  return @seq;
+} # sub loadfasta
+
+
+
+###############################################################
+sub indexfasta { my ( $seqref, $stripheaders ) = @_;
+###############################################################
+# if $stripheaders is true, remove anything in header after
+# the first white space. Returns a hash reference, key is
+# header, value is array index
+  my %index;
+  for my $i ( 0..$#{$seqref} )
+    {
+      my $hdr = $seqref->[$i]->{'hdr'};
+      if ( $stripheaders ) { $hdr =~ s/\s.*$//; }
+      if ( defined $index{$hdr} ) { die "Error, duplicate header \"$hdr\" while indexing\n"; }
+      $index{$hdr} = $i;
+    }
+  return \%index
+} # sub indexfasta
+
+
+
+# eof
