@@ -9,7 +9,7 @@ Generate a consensus of a multi-fasta alignment
 use strict;
 use warnings;
 use Getopt::Long;      # for getting command line parameters
-my $ver="1.0";
+my $ver="1.1";  # 1.1 add --dropinvariant and some error checking
 
 
 
@@ -73,6 +73,7 @@ my $majority     = $defaultmajority;
 my $nodegen      = 0;
 my $wrap         = $defaultwrap;
 my $report;
+my $dropinvariant;
 my $help         = 0;    # print help and exit
 my $quiet        = 0;    # only show errors
 my $debug        = 0;    # print extra debugging information
@@ -85,6 +86,7 @@ GetOptions (
             "report:s"       => \$report,            # flag|filename
             "unknown=s"      => \$unknown,           # string(char list)
             "wrap=i"         => \$wrap,              # integer
+            "dropinvariant"  => \$dropinvariant,     # flag
             "help"           => \$help,              # flag
             "quiet"          => \$quiet,             # flag
             "debug"          => \$debug);            # flag
@@ -126,6 +128,8 @@ Optional parameters:
                     default is no wrap
   --report[=xxx]    print a summary of base frequencies
                     optional value is output file name, default is STDOUT
+  --dropinvariant   all locations where all sequences are identical are
+                    eliminated, and sequences will therefore be shortened
   --help            print this screen
   --quiet           only print error messages
   --debug           print extra debugging information
@@ -149,6 +153,64 @@ for my $i ( 0 .. length($unknown)-1 )
 debugmsg ( "Loading input file \"$infilename\"" );
 @seq = loadfasta ( $infilename, 1 );
 unless ( $quiet ) { print "Loaded ".commify(scalar @seq)." sequences\n"; }
+
+
+
+############################################################
+# error checking
+############################################################
+unless ( @seq ) { die "Error, no sequences loaded from \"$infilename\"\n"; }
+unless ( ( scalar @seq ) > 1 ) { die "Error, only one sequence loaded from \"$infilename\"\n"; }
+my $lzero = length( $seq[0]->{seq} );
+my $okay = 1;
+for my $i ( 1..$#seq )
+  {
+    my $li = length( $seq[$i]->{seq} );
+    if ( $li != $lzero )
+      {
+        $okay = 0;
+        print "Error, length of sequence #".($i+1).":$li is"
+            . " not equal to length of sequence #1:$lzero\n";
+      }
+  }
+unless ( $okay ) { exit 1; }
+
+
+
+############################################################
+# optional --dropinvariant
+############################################################
+if ( $dropinvariant )
+  {
+    my @newseq;
+    my $newlen = 0;
+    for my $i ( 0..$#seq )
+      { $newseq[$i]->{hdr} = $seq[$i]->{hdr}; }
+    for my $i ( 0 .. length($seq[0]->{seq})-1 )
+      {
+        my %counts;
+        foreach my $aseq ( @seq )
+          {
+            my $base = substr($aseq->{seq}, $i, 1);
+            $counts{$base}++;
+          }
+        # will be only one key in %counts if all bases were identical
+        if ( ( scalar keys %counts ) > 1 )
+          {
+            for my $j ( 0..$#seq )
+              {
+                my $base = substr($seq[$j]->{seq}, $i, 1);
+                $newseq[$j]->{seq} .= $base;
+              }
+            $newlen++;
+          }
+      } # for $i
+    unless( $newlen )
+      { die "Error, all sequences were identical and --dropinvariant was specified\n"; }
+    unless( $quiet )
+      { print "Sequence length after removal of invariant sites is ".commify($newlen)."\n"; }
+    @seq = @newseq;
+  } # if ( $dropinvariant )
 
 
 
@@ -253,7 +315,7 @@ if ( defined $report )
 ############################################################
 # cleanup and end program
 ############################################################
-unless ( $quiet ) { print "Done\n"; }
+unless ( $quiet ) { print "$0 Done\n"; }
 exit 0;
 
 
