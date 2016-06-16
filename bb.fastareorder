@@ -15,6 +15,7 @@ use Getopt::Long;      # for getting command line parameters
 #                                 Modify to work with scaffolds also
 # Version 1.2 August 21, 2014   - Add --spacer flag
 # Version 1.3 April 5, 2016     - Add --gff and --keyforgff, now supports .gz compression
+# Version 1.4 June 15, 2016     - Update to --lifttable to support --oneseq
 
 
 
@@ -305,7 +306,7 @@ foreach my $infilename ( @infilenames )
       } # if quality file found
     else  # no quality file found
       {
-        unless ( $quiet ) { print "No corresponding quality file \"$inqualname\" found\n"; }
+        debugmsg( "No corresponding quality file \"$inqualname\" found" );
       } # else no quality file found
     } # unless ( $noqual )
   } # foreach $infilename
@@ -415,6 +416,7 @@ for my $i ( 0 .. $#seq )
         unless ( $Nlen ) { $Nlen = $spacerlen; }
         $aseq = "N"x$Nlen; 
         if ( $doqual ) { $aqual = "00 "x$Nlen; }  # not tested this may be wrong @@@
+        $inhdr{$aseqnum} = $aseqnum;  # for --lifttable
       }
     else
       {
@@ -511,13 +513,6 @@ for my $i ( 0 .. $#seq )
         if ( $doqual ) { $aqual = qualrev ( $aqual ); }
       }
 
-    # store contig coordinates
-    if ( $coordinates )
-      {
-        push ( @coordinatesdata, join ( "\t", $aseqnum, $rc?"-":"+", $currposition, ( $currposition+$seqlen-1 ) ) );
-      }
-    $currposition += $seqlen;
-
     # print header to ouput ( unless concatenating )
     $nseq++;
     my $thishdr;
@@ -545,21 +540,34 @@ for my $i ( 0 .. $#seq )
               { $outqdata .= $thishdr; }
           }
       }
-    if ( $startstop ) { $currbp += $seqlen; }
+
+    # optional lift table
+    if ( $lifttable )
+      {
+        my $shortouthdr;
+        if ( $oneseq )
+          { $shortouthdr = $oneseq; }
+        else
+          { ( $shortouthdr = $thishdr ) =~ s/ .*//; }
+        ( my $shortinhdr = $inhdr{$aseqnum} ) =~ s/ .*//;
+        my $s = ( $range[1] || 1 );
+        my $e = ( $range[2] || $seqlen );
+        if ( $rc ) { ( $s, $e ) = ( $e, $s ); }
+        print $LFT join( "\t", $shortouthdr, $currbp+1, $currbp+$seqlen,
+                               $shortinhdr, $s, $e ), "\n";
+      }
+
+    if ( ( $startstop ) or ( $lifttable ) ) { $currbp += $seqlen; }
+
+    # store contig coordinates
+    if ( $coordinates )
+      {
+        push ( @coordinatesdata, join ( "\t", $aseqnum, $rc?"-":"+", $currposition, ( $currposition+$seqlen-1 ) ) );
+      }
+    $currposition += $seqlen;
 
     # print sequence to output, and follow with a return
     $outfdata .= $aseq . "\n";
-
-    # optional lift table
-    if ( ( $LFT ) and ( $thishdr ) )
-      {
-        # Lift table = newid newstart newend oldid oldstart oldend
-        ( my $id = $thishdr ) =~ s/\s.*$//;
-        $id =~ s/[>\n]//g;
-        unless ( $range[1] ) { $range[1] = 1; }
-        unless ( $range[2] ) { $range[1] = $seqlen; }
-        print $LFT join( "\t", $id, 1, $seqlen, $id, $range[1], $range[2] ), "\n";
-      }
 
     # optional spacer for --onesequence mode for all but last sequence
     if ( ( $spacer ) and ( $i < $#seq ) )
