@@ -9,7 +9,9 @@ Generate a consensus of a multi-fasta alignment
 use strict;
 use warnings;
 use Getopt::Long;      # for getting command line parameters
-my $ver="1.1";  # 1.1 add --dropinvariant and some error checking
+                # 1.1 add --dropinvariant and some error checking
+                # 1.2 add --table, fix lower case problem
+my $ver="1.3";  # 1.3 add --gapfraction
 
 
 
@@ -19,6 +21,7 @@ my $ver="1.1";  # 1.1 add --dropinvariant and some error checking
 my $defaultunknown = '?*-';
 my $defaultwrap = 0;
 my $defaultmajority = 20;
+my $defaultgapfraction = 1;
 my %degen = (  # lookup for degenerate bases
   'A'    => 'A',
   'AC'   => 'M',
@@ -70,10 +73,12 @@ my $outfilename  = "";   # output file name
 my $consensusonly;
 my $unknown      = $defaultunknown;
 my $majority     = $defaultmajority;
+my $gapfraction  = $defaultgapfraction;
 my $nodegen      = 0;
 my $wrap         = $defaultwrap;
 my $report;
 my $dropinvariant;
+my $table;
 my $help         = 0;    # print help and exit
 my $quiet        = 0;    # only show errors
 my $debug        = 0;    # print extra debugging information
@@ -81,9 +86,11 @@ GetOptions (
             "infile=s"       => \$infilename,        # string
             "outfile=s"      => \$outfilename,       # string
             "majority=s"     => \$majority,          # string(real)
+            "gapfraction=s"  => \$gapfraction,       # string(real)
             "nodegenerate"   => \$nodegen,           # flag
             "consensusonly"  => \$consensusonly,     # flag
             "report:s"       => \$report,            # flag|filename
+            "table=s"        => \$table,             # filename
             "unknown=s"      => \$unknown,           # string(char list)
             "wrap=i"         => \$wrap,              # integer
             "dropinvariant"  => \$dropinvariant,     # flag
@@ -96,7 +103,7 @@ unless ( $infilename ) { $help = 1 }
 unless ( $outfilename ) { $help = 1 }
 if ( $outfilename eq "-" ) { $quiet = 1 }
 
-
+ 
 
 ############################################################
 # print help screen
@@ -118,6 +125,8 @@ Optional parameters:
                     this percentage of most abundant, then
                     generate a degenerate base. Default = $defaultmajority,
                     use --majority=0 to only select most abundant base
+  --gapfraction=xxx value between 0 and 1, if >= this fraction of sequences have
+                    gap character, make consensus gap also. Default = $defaultgapfraction
   --nodegen         do not use degenerate base codes in the consensus
                     sequence. If equal frequencies, choose one at random
   --consensusonly   only output the consensus sequence
@@ -128,6 +137,9 @@ Optional parameters:
                     default is no wrap
   --report[=xxx]    print a summary of base frequencies
                     optional value is output file name, default is STDOUT
+  --table=xxx       save a table with all variant locations relative to
+                    consensus: 'D' for deletion, 'I' for insertion,
+                    'P' for polymorphism, '.' for same as consensus
   --dropinvariant   all locations where all sequences are identical are
                     eliminated, and sequences will therefore be shortened
   --help            print this screen
@@ -142,8 +154,22 @@ Optional parameters:
 ############################################################
 # generate unknown base hash
 ############################################################
+{
 for my $i ( 0 .. length($unknown)-1 )
   { $unk{substr($unknown, $i, 1)} = 1; }
+# to all degenerate combinations, add an additional one with gap character included
+my @tmp = keys( %degen );
+foreach my $u ( keys %unk )
+  {
+    $degen{$u} = $u;
+    foreach my $t ( @tmp )
+      {
+        # characters in key must be in alphabetical order
+        my $sortkey = join( '', sort( split(//, $u.$t ) ) );
+        $degen{$sortkey} = $degen{$t};
+      } # for $t
+  } # for $u
+}
 
 
 
@@ -182,6 +208,7 @@ unless ( $okay ) { exit 1; }
 ############################################################
 if ( $dropinvariant )
   {
+    debugmsg ( "Drop invariant" );
     my @newseq;
     my $newlen = 0;
     for my $i ( 0..$#seq )
@@ -191,7 +218,7 @@ if ( $dropinvariant )
         my %counts;
         foreach my $aseq ( @seq )
           {
-            my $base = substr($aseq->{seq}, $i, 1);
+            my $base = uc(substr($aseq->{seq}, $i, 1));
             $counts{$base}++;
           }
         # will be only one key in %counts if all bases were identical
@@ -199,7 +226,7 @@ if ( $dropinvariant )
           {
             for my $j ( 0..$#seq )
               {
-                my $base = substr($seq[$j]->{seq}, $i, 1);
+                my $base = uc(substr($seq[$j]->{seq}, $i, 1));
                 $newseq[$j]->{seq} .= $base;
               }
             $newlen++;
@@ -223,59 +250,72 @@ foreach my $aseq ( @seq )
   {
     for my $i ( 0 .. length($aseq->{seq})-1 )
       {
-        my $base = substr($aseq->{seq}, $i, 1);
-        unless ( $unk{$base} ) # skip gaps
-          {
+        my $base = uc(substr($aseq->{seq}, $i, 1));
+#        unless ( $unk{$base} ) # skip gaps
+#          {
             $counts[$i]->{$base}++;
             $allbases{$base}++;
-          }
+#          }
       }
   } # for $aseq
 
 debugmsg ( "Generating consensus" );
 my %consseq = ( 'seq' => '', 'hdr' => 'Consensus' );
+my $ngapsincons = 0;
 for my $i ( 0 .. $#counts )
   {
     # rank bases by frequency
     my @byfreq = sort { $counts[$i]->{$b} <=> $counts[$i]->{$a} } keys %{$counts[$i]};
 
-    ### code for degenerate
     my $totalbases = 0;
     foreach my $base ( keys %{$counts[$i]} )
       { $totalbases += $counts[$i]->{$base}; }
-    my @pct;
-    my @deg;
-    for my $j ( 0 .. 3 )
+
+    ### Gap to consensus
+    if ( ( ( $counts[$i]->{'-'} // 0 ) / $totalbases ) >= $gapfraction )
       {
-        last unless ( $byfreq[$j] );
-        $pct[$j] = $counts[$i]->{$byfreq[$j]} * 100 / $totalbases;
-        if ( $j == 0 )
-          { push ( @deg, $byfreq[$j] ); }
-        else
+        $consseq{seq} .= '-';
+        $ngapsincons++;
+      }
+    else
+      {
+
+        ### code for degenerate
+        my @pct;
+        my @deg;
+        for my $j ( 0 .. 3 )
           {
-            if ( ( $pct[$j] + $majority ) >= $pct[0] )
+            last unless ( $byfreq[$j] );
+            $pct[$j] = $counts[$i]->{$byfreq[$j]} * 100 / $totalbases;
+            if ( $j == 0 )
               { push ( @deg, $byfreq[$j] ); }
             else
-              { last; }
+              {
+                if ( ( $pct[$j] + $majority ) >= $pct[0] )
+                  { push ( @deg, $byfreq[$j] ); }
+                else
+                  { last; }
+              }
+          } # for $j
+        my $degenstr = join ( '', sort ( @deg ) );  # alphabetical to simplify degenerate hash
+        if ( $nodegen )
+          {
+            if ( ( $degenstr =~ m/[\?N\-]/ ) and ( substr($degenstr,1,1) !~ m/[\?N\-]/ ))
+              { $degenstr = substr($degenstr,1,1); }
+            else
+              { $degenstr = substr($degenstr,0,1); }
           }
-      }
-    my $degenstr = join ( '', sort ( @deg ) );  # alphabetical to simplify degenerate hash
-    if ( $nodegen )
-      {
-        if ( ( $degenstr =~ m/[\?N\-]/ ) and ( substr($degenstr,1,1) !~ m/[\?N\-]/ ))
-          { $degenstr = substr($degenstr,1,1); }
-        else
-          { $degenstr = substr($degenstr,0,1); }
-      }
-    my $db = $degen{uc($degenstr)};
-    unless ( $db )
-      {
-        $db = "N";
-        print "Warning, cannot lookup degenerate base for \"$degenstr\" position $i totalbases=$totalbases, converting to \"N\"\n";
-      }
-    $consseq{seq} .= $db;
+        my $db = $degen{uc($degenstr)};
+        unless ( $db )
+          {
+            $db = "N";
+            print "Warning, cannot lookup degenerate base for \"$degenstr\" position $i totalbases=$totalbases, converting to \"N\"\n";
+          }
+        $consseq{seq} .= $db;
+      } # else not >= $gapfraction
   } # for $i
 unshift ( @seq, \%consseq );
+unless ( $quiet ) { print commify($ngapsincons)." gaps in consensus\n"; }
 }
 
 
@@ -290,7 +330,7 @@ savefasta ( $outfilename, \@seq, $wrap );
 
 
 ############################################################
-# report
+# --report
 ############################################################
 if ( defined $report )
   {
@@ -308,7 +348,93 @@ if ( defined $report )
         print $OUTF "\n";
       }
     stdclose ( $OUTF );
-  }
+  } # if $report
+
+
+
+############################################################
+# --table
+############################################################
+if ( $table )
+  {
+    my $OUTF = stdopen ( ">", $table );
+    # header line
+    print $OUTF join( "\t", 'Start', 'End' );
+    foreach my $aseq ( @seq )
+      {
+        ( my $id = $aseq->{hdr} ) =~ s/\s.*$//;
+        print $OUTF "\t", $id;
+      }
+    print $OUTF "\n";
+
+    # table body - record SNPs relative to consensus, and deletions
+    my %events;  # 3-D hash, first index is start, second is end, third is genotype index, value is 'D' or 'P'
+    for my $i ( 0 .. $#seq )
+      {
+        my $status = '.';
+        my $coord;
+        for my $j ( 0 .. length($seq[$i]->{seq})-1 )
+          {
+            my $nt = substr($seq[$i]->{seq},$j,1);
+            my $connt = substr($seq[0]->{seq},$j,1);
+            if ( $nt eq $connt )
+              {
+                if ( $status ne '.' )
+                  { $events{$coord}->{$j-1}->[$i] = $status; }
+                $status = '.';
+                $coord = undef;
+              }
+            elsif ( $nt eq '-' )
+              {
+                if ( $status ne 'D' )
+                  {
+                    if ( $status ne '.' )
+                      { $events{$coord}->{$j-1}->[$i] = $status; }
+                    $status = 'D';
+                    $coord = $j;
+                  }
+              }
+            elsif ( $connt eq '-' )
+              {
+                if ( $status ne 'I' )
+                  {
+                    if ( $status ne '.' )
+                      { $events{$coord}->{$j-1}->[$i] = $status; }
+                    $status = 'I';
+                    $coord = $j;
+                  }
+              }
+            else
+              {
+                if ( $status ne 'P' )
+                  {
+                    if ( $status ne '.' )
+                      { $events{$coord}->{$j-1}->[$i] = $status; }
+                    $status = 'P';
+                    $coord = $j;
+                  }
+              }
+          } # for $j
+        if ( $status ne '.' )
+          { $events{$coord}->{length($seq[$i]->{seq})-1}->[$i] = $status; }
+      } # for $i
+
+    for my $i ( sort{$a<=>$b} keys %events )  # start coordinate
+      {
+        for my $j ( sort{$a<=>$b} keys %{$events{$i}} )  # end coordinate
+          {
+            print $OUTF join( "\t", $i+1, $j+1 );
+            for my $k ( 0 .. $#seq )
+              {
+                my $state = '.';
+                if ( ( $events{$i} ) and ( $events{$i}->{$j} ) and ( $events{$i}->{$j}->[$k] ) )
+                  { $state = $events{$i}->{$j}->[$k]; }
+                print $OUTF "\t", $state;
+              } # for $k
+            print $OUTF "\n";
+          } # for $j
+      } # for $i
+  } # if $table
 
 
 
