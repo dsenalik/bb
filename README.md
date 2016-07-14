@@ -65,6 +65,12 @@ genome reveals DNA rearrangement events and a novel transcript
 [BMC Plant Biology 2014, 14:45](http://www.biomedcentral.com/1471-2229/14/45)
 doi:10.1186/1471-2229-14-45
 
+bb.coverage
+-----------
+
+This program generates coverage plots from various types of input.
+Fasta, fastq, sff, bam, or bed file input can be used.
+
 bb.elsdlt
 ---------
 
