@@ -9,9 +9,10 @@ Generate a consensus of a multi-fasta alignment
 use strict;
 use warnings;
 use Getopt::Long;      # for getting command line parameters
+
                 # 1.1 add --dropinvariant and some error checking
-                # 1.2 add --table, fix lower case problem
-my $ver="1.3";  # 1.3 add --gapfraction
+                # 1.2 May 29, 2016, add --table, fix lower case problem
+my $ver="1.3";  # 1.3 July 12, 2016, add --gapfraction
 
 
 
@@ -178,6 +179,9 @@ foreach my $u ( keys %unk )
 ############################################################
 debugmsg ( "Loading input file \"$infilename\"" );
 @seq = loadfasta ( $infilename, 1 );
+# do analysis in all upper case
+foreach my $aseq ( @seq )
+  { $aseq->{seq} = uc($aseq->{seq}); }
 unless ( $quiet ) { print "Loaded ".commify(scalar @seq)." sequences\n"; }
 
 
@@ -218,7 +222,7 @@ if ( $dropinvariant )
         my %counts;
         foreach my $aseq ( @seq )
           {
-            my $base = uc(substr($aseq->{seq}, $i, 1));
+            my $base = substr($aseq->{seq}, $i, 1);
             $counts{$base}++;
           }
         # will be only one key in %counts if all bases were identical
@@ -226,7 +230,7 @@ if ( $dropinvariant )
           {
             for my $j ( 0..$#seq )
               {
-                my $base = uc(substr($seq[$j]->{seq}, $i, 1));
+                my $base = substr($seq[$j]->{seq}, $i, 1);
                 $newseq[$j]->{seq} .= $base;
               }
             $newlen++;
@@ -250,7 +254,7 @@ foreach my $aseq ( @seq )
   {
     for my $i ( 0 .. length($aseq->{seq})-1 )
       {
-        my $base = uc(substr($aseq->{seq}, $i, 1));
+        my $base = substr($aseq->{seq}, $i, 1);
 #        unless ( $unk{$base} ) # skip gaps
 #          {
             $counts[$i]->{$base}++;
@@ -283,19 +287,22 @@ for my $i ( 0 .. $#counts )
         ### code for degenerate
         my @pct;
         my @deg;
-        for my $j ( 0 .. 3 )
+        for my $j ( 0 .. $#byfreq )
           {
-            last unless ( $byfreq[$j] );
             $pct[$j] = $counts[$i]->{$byfreq[$j]} * 100 / $totalbases;
-            if ( $j == 0 )
-              { push ( @deg, $byfreq[$j] ); }
-            else
+            # skip gaps in consensus, --gapfraction does that
+            unless ( $unk{$byfreq[$j]} )
               {
-                if ( ( $pct[$j] + $majority ) >= $pct[0] )
+                unless ( @deg )  # first entry in list
                   { push ( @deg, $byfreq[$j] ); }
                 else
-                  { last; }
-              }
+                  {
+                    if ( ( $pct[$j] + $majority ) >= $pct[0] )
+                      { push ( @deg, $byfreq[$j] ); }
+                    else
+                      { last; }
+                  } # else after first entry
+              } # unless gap character
           } # for $j
         my $degenstr = join ( '', sort ( @deg ) );  # alphabetical to simplify degenerate hash
         if ( $nodegen )
@@ -305,7 +312,8 @@ for my $i ( 0 .. $#counts )
             else
               { $degenstr = substr($degenstr,0,1); }
           }
-        my $db = $degen{uc($degenstr)};
+        my $db = $degen{$degenstr};
+        if ( $unk{$db} ) { $ngapsincons++; }
         unless ( $db )
           {
             $db = "N";

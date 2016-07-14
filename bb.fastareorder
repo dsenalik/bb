@@ -10,19 +10,20 @@ Rearrange the order of sequences in a FASTA file
 use strict;
 use warnings;
 use Getopt::Long;      # for getting command line parameters
-# version 1.0 Spetember 3, 2011
+# version 1.0 September 3, 2011
 # Version 1.1 September 3, 2011 - Add subrange feature to --seq
 #                                 Modify to work with scaffolds also
 # Version 1.2 August 21, 2014   - Add --spacer flag
 # Version 1.3 April 5, 2016     - Add --gff and --keyforgff, now supports .gz compression
 # Version 1.4 June 15, 2016     - Update to --lifttable to support --oneseq
+# Version 1.5 July 13, 2016     - add --removezeroes, this is no longer default behavior
+my $version = "1.5";
 
 
 
 ############################################################
 # configuration variables
 ############################################################
-my $version = "1.1";
 my $spacerlen = 20;
 my $defaultwrap = 100;
 my $defaultglobalprefix = "contig";
@@ -71,6 +72,7 @@ my $noqual      = 0;    # do not attempt to include qual file
 my $blankline   = 0;    # blank line between sequences in --onesequence mode
 my $random      = 0;    # return this many random contigs
 my $trim        = 0;    # trim header after first white space
+my $removezeroes;       # remove internal leading zeroes
 my $flank       = 0;    # flanking sequence
 my $replace;            # for search and replace
 my $with;               # for search and replace
@@ -98,6 +100,7 @@ GetOptions (
             "trim"           => \$trim,              # flag
             "flank=i"        => \$flank,             # integer
             "random=i"       => \$random,            # integer
+            "removezeroes"   => \$removezeroes,      # flag
             "wrap:i"         => \$wrap,              # flag/integer
             "unique"         => \$makeunique,        # flag
             "replace=s"      => \$replace,           # string
@@ -145,7 +148,7 @@ Required parameters:
                     colon dividers, specifying start and stop,
                     e.g. --seq=12:100:200 The subrange is taken
                     before reverse complementing, if so indicated
-                    --seq=xx:-100 returns the last 100 b.p.
+                    --seq=xx:-100 returns the last 100 nt
                     1:-1 is the whole string, -1:-1 is the last char
                     The --seq parameter may be omitted if --exclude
                     --random or --gff are used instead
@@ -169,6 +172,8 @@ Optional parameters:
   --onesequence[=xxx] concatenate all sequences into one. If a value
                     is specified, that is used as the header.
                     use --trim to inhibit supplemental info
+  --removezeroes    remove internal leading zeroes in sequence name,
+                    e.g. contig00001 is renamed to contig1
   --spacer[=xxx]    when using --onesequence, add a spacer of $defaultspacer N's
                     between every sequence, or other length as specified
   --annotate        if --onesequence used, put extra information in
@@ -246,7 +251,8 @@ foreach my $infilename ( @infilenames )
             if ( $trim ) { $hdr =~ s/\s.*//; }
             ( $currkey = $hdr ) =~ s/\s.*$//;  # header up to first white space
             # remove internal leading zeros in key, e.g. contig00001 becomes contig1
-            $currkey =~ s/^([^\d]*)0+([^0])/$1$2/;
+            if ( $removezeroes )
+              { $currkey =~ s/^([^\d]*)0+([^0])/$1$2/; }
             $inhdr{$currkey} = $hdr;  # ">" has been removed
             push ( @originalorder, $currkey );
             if ( ( scalar keys %inhdr ) <= 10 ) { debugmsg ( "Reading in sequence with key \"$currkey\", header \"$hdr\"" ); }
@@ -495,7 +501,7 @@ for my $i ( 0 .. $#seq )
 
     # annotation
     $ann .= "(" . ($seqlen) . 'nt@' . ($currposition) . "-" . ($currposition+$seqlen-1) . ")";
-    debugmsg ( "Adding sequence \"$aseqnum\" " . ($rc?"=ReverseComplement":"") . ", " . commify($seqlen) . " b.p." );
+    debugmsg ( "Adding sequence \"$aseqnum\" " . ($rc?"=ReverseComplement":"") . ", " . commify($seqlen) . " nt" );
 
     # strip leading and trailing white space from sequence
     $aseq =~ s/^\s+//;
@@ -611,7 +617,7 @@ if ( ( scalar @exclude ) and ( ! scalar @seq ) )  # if both --seq and --exclude 
         my $aqual = "";
         if ( $doqual ) { $aqual = $inqseq{$key}; }
 
-        debugmsg ( "Adding sequence $key, " . commify(length($aseq)) . " b.p." );
+        debugmsg ( "Adding sequence $key, " . commify(length($aseq)) . " nt" );
 
         # strip leading and trailing white space from sequence
         $aseq =~ s/^\s+//;
@@ -691,7 +697,7 @@ print $OUTF wrapper($outfdata);
 stdclose ( $OUTF );
 unless ( $quiet )
   {
-    print "Output file created, " . commify($nlines) . " lines, " . commify($nseq) . " sequences, ".commify($currposition-1)." b.p.\n";
+    print "Output file created, " . commify($nlines) . " lines, " . commify($nseq) . " sequences, ".commify($currposition-1)." nt\n";
     if ( $annotate ) { debugmsg ( "++ " . join ( "\n++ ", @seq ) ); }
   }
 if ( $doqual )

@@ -1,0 +1,1582 @@
+#!/usr/bin/perl
+#----------------------------------------------------------#
+#        Author: Douglas Senalik dsenalik@wisc.edu         #
+#----------------------------------------------------------#
+# "Black Box" program series
+=bb
+Create a plot of coverage of raw reads on a reference sequence
+=cut bb
+use strict;
+use warnings;
+use Getopt::Long;      # for getting command line parameters
+use Sys::CPU;          # for default number of cpu cores to use
+use File::Temp  qw/ tempfile /;
+# version 1.0  July 14, 2016
+
+
+
+############################################################
+# configuration variables
+############################################################
+my $sffinfocmd = "/opt/454/bin/sffinfo";  # Roche program to extract FASTA from sff
+my $makeblastdbcmd = "makeblastdb";  # program to compile BLAST database, can add path here if necessary
+my $blastcmd = "blastn";             # program to perform BLAST search, can add path here if necessary
+my $gnuplotcmd = "gnuplot";          # program to create plot
+my $resizecmd = "convert";           # program to rescale image, convert is part of imagemagick
+my $defaultdbname = "tmp.db";        # default blast database name
+my $dbnamewithpath = "";             # blast database name including cache path
+my $maxalignments = 2000000;         # maximum number of alignments
+my $defaultevalue = 0.01;            # defaults for blastn
+my $defaultlenmin = 200;             #   "
+my $defaultpctmin = 90;              #   "
+my $defaultgc = 101;                 # for optional gc plot, window size to calculate gc ratio
+my $defaultformat = "png";           # graph image file format (for gnuplot)
+my $defaultxlabel = 'Reference Sequence in b.p.';
+my $defaultylabel = 'Coverage Depth';
+my $defaultxsize = 1600;             # default plot width
+my $defaultysize = 600;              # default plot height
+my $tempfiletemplate = "bb.coverage.tmp.XXXX";
+my $plotareabg = '#FFFFFF';          # color of plot area, currently hard coded to white
+my $defaultmarkerlabelstagger = 5;   # this many y positions for successive marker labels, set to 0 to disable
+my $updateinterval = 10000;          # progress update interval
+my $defaultshown = 10;               # default for --shown if no other value specified
+my $defaultnumcpu = int (Sys::CPU::cpu_count() * 0.75 + 0.26);  # number of processors for blast step, defaults to approx 3/4 of processors
+my $defaultshoworfs = 0.95;          # fraction of Y axis for orfs plot
+# colors for orf reading frames, order is -3 -2 -1 notused 1 2 3
+my @orfcolor = ( '#377EB8', '#4DAF4A', '#984EA3', '#808080', '#FF7F00', '#A65628', '#E41A1C' );
+my $defaultbowtiemode = "sensitive";
+my $defaultfill = "#B0E0E6";         # fill color B0E0E6=powder blue
+my $samtoolssortmem = "10000000000";  # 10 GBytes, default is 500000000 which is 500 MBytes
+my $defaultmarkercolor = '#B0C4DE';  # LightSteelBlue
+my $fontpath = "/usr/share/fonts/:/usr/share/fonts/dejavu:/usr/share/fonts/truetype/dejavu";
+my $defaultpngfont = "DejaVuSans,9";
+my $defaultpsfont = "Arial";
+my $defaultmarkerlabelheight = '0.95';
+
+
+
+############################################################
+# global variables
+############################################################
+my $ansiup = "\033[1A";       # terminal control
+(my $prognopath = $0) =~ s/^.*[\/\\]//;
+my @reffullheaders = ();      # reference FASTA headers
+my @refsequences = ();        # reference FASTA sequence ( used only for gc ratio )
+my @reflengths = ();          # lengths of reference sequences
+my @refhdrkeys = ();          # list of reference FASTA headers up to first space
+my %refhdrhash = ();          # hash of @refhdrkeys to find index, and to check for duplicates
+my $tmpdir = "/tmp";          # becomes $cachename if a cache directory is specified
+my @coverage = ();            # array of arrays
+my @greps;                    # to limit to only certain sequences in an input bam
+my $calccoverage = 0;         # 1 if need to calculate coverage by blast. 0 if using BED files
+my %persequencemarkers;       # from --parse procesing
+my $orfdata = "";             # gnuplot commands for displaying orfs, insert into command file directly
+my $permanentdb = 0;          # true when using precompiled blast database
+my $coverageby;
+my $objcounter = 0;
+
+
+
+############################################################
+# command line parameters
+############################################################
+my @sffnames       = ();   # one or more sff files of raw reads
+my $dbname         = "";   # name of blast database
+my @fastanames     = ();   # one or more FASTA files of raw reads
+my @fastqnames     = ();   # one or more FASTQ files of raw reads
+my @referencenames = ();   # reference sequences in FASTA format
+my @bamnames       = ();   # coverage from .bam files
+my @bednames       = ();   # coverage already calculated in BED format
+my @rochenames     = ();   # coverage to be extracted from 454PairAlign.txt from Roche mapper
+my $outpath        = "";   # graph image file output directory
+my $image          = "";   # image file name
+my $noimage;               # inhibit image creation
+my $shown;                 # show tracts of this many consecutive N's on plot
+my $cachename      = "";   # directory name to save BLAST output
+my $numcpu         = $defaultnumcpu;    # number of processors for blast step
+my $htmlname       = "";   # append some HTML code to this page
+my $build          = 0;    # recalculate everything flag
+my $wspacing       = 0;    # wiggle file flag and spacing
+my $wname;                 # optional wiggle file name
+my $whname;                # optional wiggle name in header of wiggle file
+my $lenmin         = $defaultlenmin;    # minimum blast hit total length
+my $pctmin         = $defaultpctmin;    # minimum blast hit percent match
+my $evalue         = $defaultevalue;    # e-value used for blast search
+my $font           = $defaultpngfont;
+my $format         = $defaultformat;    # graph file format, e.g. "png"
+my $xsize          = $defaultxsize;     # plot width
+my $ysize          = $defaultysize;     # plot height
+my $xlabel         = $defaultxlabel;
+my $ylabel         = $defaultylabel;
+my $title;
+my $xscale;
+my $xtics;
+my $mxtics;
+my $xmin           = 1;    # plot x axis minimum
+my $xmax;                  # plot x axis maximum, undefined = use auto scaling
+my $ymin           = 0;    # plot y axis minimum
+my $ymax;                  # plot y axis maximum, undefined = use auto scaling
+my $nointlabel;            # no internal label
+my $nolegend;              # no legend
+my $leftcrop       = 0;
+my $rightcrop      = 0;
+my $thumbnail      = 0;    # make a thumbnail at this scale
+my $gc;                    # plot percent gc if defined, if value use that window size
+my $transform;             # experimental
+my $fill;
+my $showorfs;              # plot orfs
+my @markers;
+my $markerlabelstagger = $defaultmarkerlabelstagger;
+my $markerlabelheight = $defaultmarkerlabelheight;
+my $bowtiemode     = $defaultbowtiemode;
+my $parse          = 0;    # parse header from bb.fastareorder --annotate
+my $help           = 0;    # print help and exit
+my $quiet          = 0;    # only show errors
+my $debug          = 0;    # print extra debugging information
+GetOptions (
+            "sff=s"          => \@sffnames,          # string
+            "fasta=s"        => \@fastanames,        # string
+            "fastq=s"        => \@fastqnames,        # string
+            "reference=s"    => \@referencenames,    # string
+            "grep=s"         => \@greps,             # string
+            "bam=s"          => \@bamnames,          # string
+            "bed=s"          => \@bednames,          # string
+            "roche=s"        => \@rochenames,        # string
+            "outpath=s"      => \$outpath,           # string
+            "image=s"        => \$image,             # string
+            "noimage"        => \$noimage,           # flag
+            "wiggle=i"       => \$wspacing,          # integer
+            "wigname=s"      => \$wname,             # string
+            "wigheadername=s"=> \$whname,            # string
+            "shown|showN:i"  => \$shown,             # flag/integer
+            "orfs|showorfs:s"=> \$showorfs,          # flag/real
+            "dbname=s"       => \$dbname,            # string
+            "cache=s"        => \$cachename,         # string
+            "cpu=i"          => \$numcpu,            # integer
+            "html=s"         => \$htmlname,          # string
+            "format=s"       => \$format,            # string
+            "font=s"         => \$font,              # string
+            "xsize=s"        => \$xsize,             # string (real)
+            "xtics=s"        => \$xtics,             # string (real)
+            "mxtics=s"       => \$mxtics,            # string (real)
+            "ysize=s"        => \$ysize,             # string (real)
+            "xscale=s"       => \$xscale,            # string (real)
+            "xmin=s"         => \$xmin,              # string (real)
+            "xmax=s"         => \$xmax,              # string (real)
+            "ymin=s"         => \$ymin,              # string (real)
+            "ymax=s"         => \$ymax,              # string (real)
+            "thumbnail=s"    => \$thumbnail,         # string (real)
+            "build"          => \$build,             # flag
+            "gc:i"           => \$gc,                # flag or value
+            "transform=s"    => \$transform,         # string (real)
+            "markers=s"      => \@markers,           # string array
+            "labelheight=s"  => \$markerlabelheight, # string (real)
+            "stagger=i"      => \$markerlabelstagger,# integer
+            "fill:s"         => \$fill,              # flag or color
+            "lenmin=s"       => \$lenmin,            # string (real)
+            "pctmin=s"       => \$pctmin,            # string (real)
+            "nointernallabel"=> \$nointlabel,        # flag
+            "nolegend"       => \$nolegend,          # flag
+            "title=s"        => \$title,             # flag
+            "parse"          => \$parse,             # flag
+            "leftcrop=i"     => \$leftcrop,          # integer
+            "rightcrop=i"    => \$rightcrop,         # integer
+            "mode=s"         => \$bowtiemode,        # string
+            "xlabel=s"       => \$xlabel,            # string
+            "ylabel=s"       => \$ylabel,            # string
+            "help"           => \$help,              # flag
+            "quiet"          => \$quiet,             # flag
+            "debug"          => \$debug);            # flag
+
+
+
+############################################################
+# parameter checking and some initialization
+############################################################
+# debug implies not quiet
+if ( $debug ) { $quiet = 0; }
+# check for required parameters
+if ( ( -s $dbname.".nin" ) or ( -s $dbname.".00.nin" ) ) { $permanentdb = 1; }
+unless ( ( @sffnames ) or ( @fastanames ) or ( @fastqnames ) or ( @bamnames ) or ( @bednames )
+         or ( @rochenames ) or ( $permanentdb ) ) { $help = 1; }
+if ( ( @sffnames ) or ( @fastanames ) or ( @fastqnames ) or ( $permanentdb ) ) { $calccoverage = 1; }
+unless ( @referencenames ) { $help = 1; }
+if ( ( defined $gc ) and ( $gc < 1 ) ) { $gc = $defaultgc; }
+if ( $cachename )
+  {
+    unless ( -d $cachename )
+      {
+        unless ( $help )
+          { mkdir $cachename or die "Could not create cache directory \"$cachename\": $!\n"; }
+      }
+  }
+else
+  {
+    unless ( -d $tmpdir )
+      { die "Configuration error, temporary directory \"$tmpdir\" is invalid\n"; }
+    $cachename = $tmpdir;
+  }
+unless ( $outpath ) { $outpath = "." }
+unless ( $outpath =~ m/\/$/ ) { $outpath .= "/"; }
+if ( ( defined $shown ) and ( ! $shown ) ) { $shown = $defaultshown; }
+if ( defined $showorfs )
+  {
+    unless ( $showorfs ) { $showorfs = $defaultshoworfs; }
+    if ( ( $showorfs < 0 ) or ( $showorfs > 1 ) ) { die "Error, --orfs parameter must be between 0 and 1, you specified \"$showorfs\"\n"; }
+  }
+if ( @bamnames )
+  { $coverageby = "bowtie2"; }
+else
+  { $coverageby = "blastn minlen=$lenmin minpct=$pctmin"; }
+if ( ( defined $fill ) and ( ! $fill ) )
+  { $fill = $defaultfill }
+
+
+
+############################################################
+# print help screen
+############################################################
+if ( $help )
+  {
+    print "$prognopath
+Generates a plot of raw read coverage for one or more
+reference sequences, as determined by NCBI's blast program,
+or use coverage already calculated and saved in BED or bam format
+
+Required parameters:
+  one of the following is required
+  | --sff=xxx       name of sff file with raw reads,
+  |                 multiple instances allowed
+  | --fasta=xxx     name of fasta file with raw reads,
+  |                 multiple instances allowed, can be gzipped
+  | --fastq=xxx     name of fastq file with raw reads,
+  |                 multiple instances allowed, can be gzipped
+  | --dbname=xxx    name of precompiled blast database
+  | --bed=xxx       name of BED file with coverage data from
+  |                 output of coverageBed with -d parameter,
+  |                 multiple instances allowed
+  | --bam=xxx       create this bam file if it does not already
+  |                 exist, and use it to create the above --bed
+  |                 file using --fasta or --fastq or --sff
+  |                 If --bed not specified, stop after
+  |                 creating bam file. This provides a nice
+  |                 wrapper for Bowtie2.  Multiple allowed
+  | --roche=xxx     name of 454PairAlign.txt which will be
+  |__               used to calculate coverage
+
+  --reference=xxx   reference sequences FASTA file,
+                    multiple instances allowed, or multiple
+                    sequences per file are allowed
+Optional parameters:
+  --outpath=xxx     directory for graph image files.
+                    If not specified, will be same directory
+                    as the reference sequences
+  --grep=xxx        only plot this sequence, multiple allowed
+  --image=xxx       output image name template, don't include
+                    path or extension. This is the part after \".vs.\"
+  --noimage         do not create the image file or the data file,
+                    useful if you just want to convert .bam to .bed
+  --cpu=xxx         number of processors to use for blast, default=$defaultnumcpu
+  --showN[=xxx]     mark tracts of N's in image of this length or
+                    longer; if length is not specified, $defaultshown is used
+  --showorfs[=xxx]  plot ORFs in all 6 reading frames, optional value
+                    is Y position as percent of Y axis, default is $defaultshoworfs
+  --cache=xxx       save BLAST files in this directory.
+                    If not specified, results are not saved
+  --dbname=xxx      a name for the BLAST database, required if
+                    you want to cache it
+  --wiggle=xxx      entering an integer value here will trigger
+                    creation of an optional wiggle file in the
+                    directory specified by --outpath, with the
+                    supplied spacing value, e.g. --wiggle=50
+  --wigname=xxx     use to override default wiggle file name, --wiggle still
+                    required. If contains no path, --outpath is prepended
+  --wigheadername=xxx  This is the name used in the wiggle file header
+  --format=xxx      image file format for graphs, default=\"$defaultformat\"
+  --xsize=xxx       plot width, default=$xsize
+  --ysize=xxx       plot height, default=$ysize
+  --xscale=xxx      alternative to xsize, to make image
+                    width proportional to sequence length.
+                    Units are pixels per kbp, e.g.
+                    --xscale=100 for 3,000 bp sequence =
+                    --xsize=300 (bug: but ignores margins)
+  --xtics=xxx       set major tic mark interval, default is auto
+  --mxtics=xxx      divisor for minor tic mark interval, default is auto
+  --xmin=xxx        X axis minimum, default is 1
+  --xmax=xxx        X axis maximum, default is sequence length
+  --ymin=xxx        Y axis minimum, default is 0
+  --ymax=xxx        Y axis maximum, default is autoscale
+  --xlabel=xxx      X axis label, default \"$defaultxlabel\"
+  --ylabel=xxx      Y axis label, default \"$defaultylabel\"
+  --fill[=xxx]      fill in the area under the curve with solid color
+                    default fill color is \"$defaultfill\"
+  --font=xxx        default is \"$defaultpngfont\"
+  --parse           parse FASTA header generated by bb.fastareorder --annotate
+                    and put a marker at contig borders
+  --html=xxx        append HTML code to display the graph to 
+                    this page. --thumbnail is recommended also
+  --lenmin=xxx      minimum blast hit length, default=$lenmin
+  --pctmin=xxx      minimum blast hit percent match, default=$pctmin
+  --evalue=xxx      e-value for blast, default=$evalue
+  --thumbnail=xxx   make a thumbnail of graph at the specified
+                    percentage scaling, e.g. --thumbnail=20
+  --build           regenerate all intermediate files and
+                    cached files even if they already exist
+  --gc[=xxx]        include a plot of gc percentage. Optional parameter
+                    is window size, default is $defaultgc
+  --transform       experimental, adjust coverage based on gc content
+  --markers=xxx[..xxx][,yyy][,ccc] draw a marker at this coordinate or range,
+                    with optional label yyy, color(hex) (default $defaultmarkercolor).
+                    Multiple allowed, or prefix with \"\@\" to read from a file
+  --stagger=xxx     stagger labels for above markers, number of
+                    different y positions, default=$defaultmarkerlabelstagger, 0 disables
+  --labelheight=xxx percent of graph height to put --markers labels at, default = $defaultmarkerlabelheight
+  --title=xxx       override default graph title, or use --title=0 to disable title
+  --nointernallabel do not add the label inside the plot
+  --nolegend        do not add a legend
+  --leftcrop=xxx    remove the first xxx data points
+  --rightcrop=xxx   remove the last xxx data points
+  --mode=xxx        mapping mode for bowtie2, default is \"$defaultbowtiemode\",
+                    some options are \"very-sensitive\" \"fast\" \"very-fast\"
+                    \"very-sensitive-local\" \"sensitive-local\" \"fast-local\"
+                    \"very-fast-local\" - see 
+                    http://bowtie-bio.sourceforge.net/bowtie2/manual.shtml#reporting-options
+  --help            print this screen
+  --quiet           only print error messages
+  --debug           print extra debugging information
+";
+    exit 1;
+  } # if ( $help )
+
+
+
+############################################################
+# read markers file(s) if present
+############################################################
+{
+  my @newmarkers;
+  foreach my $marker ( @markers )
+    {
+      if ( $marker =~ m/^\@(.*)$/ )
+        {
+          my $infile = $1;
+          my $INF = stdopen ( "<", $infile );
+          while ( my $aline = <$INF> )
+            {
+              $aline =~ s/[\r\n]//g;
+              $aline =~ s/\s+$//;
+              $aline =~ s/^\s+//;
+              next unless ( $aline );
+              push ( @newmarkers, $aline );
+            }
+          stdclose ( $INF );
+        }
+      else  # normal entry
+        { push ( @newmarkers, $marker ); }
+    }
+  @markers = @newmarkers;
+}
+
+
+
+############################################################
+# parse reference files to get sequence names and lengths
+############################################################
+{
+my $seqnum = -1;
+unless ( $quiet ) { print "Parsing reference files\n"; }
+foreach my $aref ( @referencenames )
+  {
+    debugmsg ( "Reading reference file \"$aref\"" );
+    my $INF = stdopen ( "<", $aref );
+    my $linenum = 0;
+    while ( my $aline = <$INF> )
+      {
+        $linenum++;
+        if ( $aline =~ m/^>(.*)$/ )
+          {
+            $seqnum++;
+            my $fullhdr = $1;
+            $fullhdr =~ s/[\r\n]//g;  # remove return
+            ( my $hdr = $fullhdr ) =~ s/ .*$//;  # keep only up to first space
+            push ( @refhdrkeys, $hdr );
+            if ( defined $refhdrhash{$hdr} )
+              { die "Error, file \"$aref\" line $linenum, duplicate header for sequence $aline"; } # still a return on $aline
+            $refhdrhash{$hdr} = $seqnum;
+
+            # parse headers from bb.fastareorder, e.g.
+            #>1.C040C14_F 2 sequences: contig2269(646nt@1-646)+-contig3162(337nt@647-983)
+            if ( $parse )
+              {
+                ( my $list = $fullhdr ) =~ s/^.*://;
+                my @parts = split ( /\+/, $list );
+                foreach my $apart ( @parts )
+                  {
+                    unless ( $apart =~ m/([^\(]+)\(\d+nt\@(\d+)/ ) { die "Error parsing \"$apart\" from header \"$fullhdr\"\n"; }
+                    my $contig = $1;
+                    my $start = $2;
+                    push ( @{$persequencemarkers{$hdr}}, "$start,$contig" );
+                  }
+              }
+          } # if header
+        else # sequence line
+          {
+            # length of sequence, ignore non-letters
+            $aline =~ s/[^A-Za-z]//g;
+            $reflengths[$seqnum] += length($aline);
+            # only save sequence in memory if we will need it later
+            if ( ( $gc ) or ( $shown ) ) { $refsequences[$seqnum] .= $aline; }
+          } # if sequence line
+      } # while <$INF>
+    stdclose ( $INF );
+  } # foreach my $aref ( @referencenames )
+unless ( $quiet ) { print "Read in ".scalar(@refhdrkeys)." reference sequences\n"; }
+}
+
+
+
+############################################################
+# convert each sff file to a FASTA file
+############################################################
+foreach my $asff ( @sffnames )
+  {
+    my $fastaversion = $asff;
+    $fastaversion =~ s/\.sff$/.fasta/i;
+    if ( ( ! -s $fastaversion ) or ( $build ) )
+      {
+        unless ( $quiet ) { print "Converting \"$asff\" to FASTA format\n"; }
+        my $cmd = $sffinfocmd . " -seq \"$asff\" > \"$fastaversion\"";
+        unless ( $quiet ) { print "COMMAND: $cmd\n"; }
+        my $result = system ( $cmd );
+        if ( $result ) { die "Error $result executing command \"$cmd\"\n"; }
+      }
+    else  # already exists
+      {
+        unless ( $quiet ) { print "FASTA file \"$fastaversion\" already exists, skipping conversion\n"; }
+      }
+    # add this to the --fasta list
+    push ( @fastanames, $fastaversion );
+  } # foreach my $asff ( @sffnames )
+
+
+
+############################################################
+# create a concatenated raw read FASTA file
+############################################################
+unless ( @bamnames )
+  {
+unless ( $dbname ) { $dbname = $defaultdbname }
+if ( ( -s $dbname . '.nin' ) or ( -s $dbname . '.00.nin' ) )
+  { $dbnamewithpath = $dbname; }  # e.g. pre-compiled blast database used
+else
+  { $dbnamewithpath = $cachename . "/" . $dbname; }
+if ( $calccoverage )
+  {
+    if ( ( ( -s "${dbnamewithpath}.nin" ) or ( -s "${dbnamewithpath}.00.nin" ) ) and ( ! $build ) )
+      {
+        unless ( $quiet ) { print "BLAST database input file already made, skipping this step\n"; }
+      }
+    elsif ( @fastanames or @fastqnames )   # file does not exist, need to create it
+      {
+        my @allnames = ( @fastanames, @fastqnames );
+        if ( ( ( scalar @allnames ) <= 1 ) 
+           and ( ( ( scalar @fastqnames ) == 0 ) or ( scalar @bamnames > 0 ) ) )
+          {
+            # can just make symbolic link
+            unless ( $quiet ) { print "Linking to raw read file\n"; }
+            # @@@@ bug: need full path for this to work
+            symlink ( $allnames[0], $dbnamewithpath ) or die "Error creating symlink \"$allnames[0]\" to \"$dbnamewithpath\": $!\n";
+          }
+        else  # more than one read file
+          {
+            unless ( $quiet ) { print "Concatenating raw read files\n"; }
+            my $OUTF = stdopen ( ">", $dbnamewithpath );
+
+            foreach my $afile ( @fastanames )
+              {
+                debugmsg ( "Concatenating file \"$afile\"" );
+                my $INF = stdopen ( "<", $afile );
+                while ( my $aline = <$INF> )
+                  {
+                    $aline =~ s/[\r]//g;  # remove DOS returns, just to be safe
+                    print $OUTF $aline;
+                  }
+                stdclose ( $INF );
+              } # foreach my $afile ( @fastanames )
+
+            foreach my $afile ( @fastqnames )
+              {
+                debugmsg ( "Concatenating file \"$afile\"" );
+                my $INF = stdopen ( "<", $afile );
+                my $linenum = 0;
+                while ( my $aline = <$INF> )
+                  {
+                    $linenum++;
+                    my $mod = ( $linenum % 4 );
+                    $aline =~ s/[\r]//g;  # remove DOS returns, just to be safe
+                    if ( $mod == 1 )
+                      { 
+                        $aline =~ s/^\@/>/;
+                        print $OUTF $aline;
+                      }
+                    elsif ( $mod == 2 )
+                      { print $OUTF $aline; }
+                  }
+                stdclose ( $INF );
+              } # foreach my $afile ( @fastqnames )
+
+            stdclose ( $OUTF );
+          } # else more than one read file
+      } # else does not exist
+    else
+      { die "Neither reads nor database \"$dbnamewithpath\" found\n"; }
+  } # if ( $calccoverage )
+  } # unless ( @bamnames )
+
+
+
+############################################################
+# compile BLAST database
+############################################################
+if ( ( $calccoverage ) and ( ! @bamnames ) )
+  {
+    if ( ( ( -s "${dbnamewithpath}.nin" ) or ( -s "${dbnamewithpath}.00.nin" ) ) and ( ! $build ) )
+      {
+        unless ( $quiet ) { print "BLAST database already compiled, skipping this step\n"; }
+      }
+    else  # file does not exist, need to create it
+      {
+        unless ( $quiet ) { print "Compiling BLAST database of raw reads\n"; }
+        my $cmd = $makeblastdbcmd;
+        $cmd .= " -in \"${dbnamewithpath}\"";
+        $cmd .= " -dbtype nucl";
+        unless ( $quiet ) { print "COMMAND: $cmd\n"; }
+        my $result = system ( $cmd );
+        if ( $result ) { die "Error $result returned from command \"$cmd\"\n"; }
+      } # else does not exist
+  } # if ( $calccoverage )
+
+
+
+############################################################
+# perform BLAST search for each reference file
+############################################################
+if ( ( $calccoverage ) and ( ! @bamnames ) )
+  {
+    foreach my $aref ( @referencenames )
+      {
+        my $blastoutfile = $aref;
+        $blastoutfile =~ s/^.*\///;  # remove path
+        ( my $shortdb = $dbname ) =~ s/^.*\///;
+        $blastoutfile = $cachename . "/" . $blastoutfile . ".vs." . $shortdb . ".blast";  # put blast results in cache directory
+        if ( ( ! -s $blastoutfile ) or ( $build ) )
+          {
+            unless ( $quiet ) { print "Performing blastn search on reference file \"$aref\"\n"; }
+            my $cmd = $blastcmd;
+            $cmd .= " -query \"$aref\"";
+            $cmd .= " -task blastn";
+            $cmd .= " -db \"$dbnamewithpath\"";
+            $cmd .= " -out \"$blastoutfile\"";
+            $cmd .= " -evalue $evalue";
+            $cmd .= " -perc_identity $pctmin";
+            $cmd .= " -outfmt 6";
+            $cmd .= " -num_alignments $maxalignments";
+            $cmd .= " -num_descriptions $maxalignments";
+            $cmd .= " -dust no";
+            $cmd .= " -num_threads $numcpu";
+            unless ( $quiet ) { print "COMMAND: $cmd\n"; }
+            my $result = system ( $cmd );
+            if ( $result )
+              {
+                unlink $blastoutfile;
+                die "Error $result returned from blast command \"$cmd\"\n";
+              }
+          }
+        else
+          { unless ( $quiet ) { print "Blast result file \"$blastoutfile\" already exists, skipping blast\n"; } }
+      } # foreach my $aref ( @referencenames )
+  } # if ( $calccoverage )
+
+
+
+############################################################
+# run bowtie2 if bam files do not exist
+############################################################
+foreach my $bam ( @bamnames )
+  {
+    unless ( -s $bam )
+      {
+        bowtie2($bam);
+      } # if bam file does not exist
+  } # foreach my $bam ( @bamnames )
+# if specified bam files and no bed files, stop here
+if ( ( @bamnames ) and ( ! @bednames ) )
+  {
+    unless ( $quiet ) { print "All bam files generated, no bed files specified, this program is done\n"; } 
+    exit 0;
+  }
+
+
+
+############################################################
+# make BED file if bam file specified
+############################################################
+if ( @bamnames )
+  {
+    # make a BED file for references if not already present
+    foreach my $ref ( @referencenames )
+      {
+        my $refbed = $ref . ".bed";
+        if ( ! -s $refbed )
+          {
+            unless ( $quiet ) { print "Creating reference BED file \"$refbed\"\n"; }
+            my $cmd = "bb.fastalen --in=\"$ref\" --each --bed --out=\"$refbed\"";
+            unless ( $quiet ) { print "COMMAND: $cmd\n"; }
+            my $result = system ( $cmd );
+            if ( $result ) { die "Error $result running command \"$cmd\"\n"; }
+          }
+      } # foreach $ref
+
+    my $i = 0;
+    foreach my $bam ( @bamnames )
+      {
+        if ( @bednames )
+          {
+            unless ( $bednames[$i] ) { die "Error, no --bed file name specified for --bam file \"$bam\"\n"; }
+            my $j = 0;
+            foreach my $ref ( @referencenames )
+              {
+                $j++;
+                my $refbed = $ref . ".bed";
+                my $thisbed = $bednames[$i];
+                # when multiple references, insert index in front of
+                # extension, or if no extension, append it
+                if ( ( scalar @referencenames ) > 1 )
+                  {
+                    unless ( $thisbed =~ s/(\.[^\.]*)$/\.$j$1/ )
+                      { $thisbed .= "." . $j; }
+                  }
+
+                # skip if --bed file already exists
+                if ( ! -s $thisbed )
+                  {
+                    unless ( $quiet ) { print "Creating BED file \"$thisbed\" from \"$bam\" + \"$refbed\"\n"; }
+                    my $cmd = "coverageBed -abam \"$bam\" -b \"$refbed\" -d > \"$thisbed\"";
+                    unless ( $quiet ) { print "COMMAND: $cmd\n"; }
+                    my $result = system ( $cmd );
+                    if ( $result ) { die "Error $result running command \"$cmd\"\n"; }
+                  }  # if not already exists
+                else
+                  {
+                    unless ( $quiet )
+                      { print "Skipping generation of BED file \"$thisbed\", file already exists\n"; }
+                  }
+              } # foreach reference
+          } # if ( @bednames )
+        $i++;
+      }
+  } # if ( @bamnames )
+
+
+
+############################################################
+# parse BLAST output files or BED files and store coverage data in memory
+############################################################
+if ( ( $calccoverage ) and ( ! @bednames ) )
+  {
+    foreach my $aref ( @referencenames )
+      {
+        my $blastoutfile = $aref;
+        $blastoutfile =~ s/^.*\///;  # remove path
+        ( my $shortdb = $dbname ) =~ s/^.*\///;
+        $blastoutfile = $cachename . "/" . $blastoutfile . ".vs." . $shortdb . ".blast";  # put blast results in cache directory
+
+        unless ( $quiet ) { print "Parsing blast search results for reference \"$aref\"\n"; }
+        my $linenum = 0;
+        my %goodblasthits;
+        my %allblasthits;
+        my $debugcounter = 10;
+        my $INF = stdopen ( "<", $blastoutfile );
+        while ( my $aline = <$INF> )
+          {
+            $linenum++;
+            $aline =~ s/[\r\n]//g;
+            my @cols = split ( /\t/, $aline );
+            $allblasthits{$cols[1]}++;
+            if ( $debugcounter ) { debugmsg ( "parsing blast hit from query \"$cols[0]\" to \"$cols[1]\"" ); }
+
+            # minimum length
+            if ( $cols[3] < $lenmin )
+              {
+                if ( $debugcounter ) { debugmsg ( "length \"$cols[3]\" below minimum \"$lenmin\"" ); }
+                next;
+              }
+
+            # minimum percent match
+            if ( $cols[2] < $pctmin )
+              {
+                if ( $debugcounter ) { debugmsg ( "match percent \"$cols[2]\" below minimum \"$pctmin\"" ); }
+                next;
+              }
+
+            # this is a mapped read
+            $goodblasthits{$cols[1]}++;
+            if ( $debugcounter ) { debugmsg ( "good mapped read \"$cols[1]\"" ); }
+
+            # get sequence index
+            my $idx = $refhdrhash{$cols[0]};
+            unless ( defined $idx ) { die "Failed index lookup for reference \"$cols[0]\", blast output file \"$blastoutfile\" line $linenum\n"; }
+
+            for my $i ( $cols[6] .. $cols[7] )
+              { $coverage[$idx]->[$i]++; }
+
+            if ( $debugcounter ) { $debugcounter--; }
+          } # while <$INF>
+        stdclose ( $INF );
+
+        if ( $linenum >= $maxalignments )
+          { print "WARNING, results may be incomplete, reached the maximum number of alignments which is ".commify($maxalignments)."\n"; }
+        unless ( $quiet )
+          { print "Mapped ".commify(scalar keys %goodblasthits)." reads out of ".commify(scalar keys %allblasthits)." blast hits to reference $aref\n"; }
+
+      } # foreach my $aref ( @referencenames )
+  } # if ( $calccoverage )
+elsif ( @bednames )  # parse BED files
+  {
+    unless ( $quiet ) { print "Reading BED features\n"; }
+    foreach my $bedfile ( @bednames )
+      {
+        debugmsg ( "Processing BED file \"$bedfile\"" );
+        my $linenum = 0;
+        my $INF = stdopen ( "<", $bedfile );
+        while ( my $aline = <$INF> )
+          {
+            $linenum++;
+            $aline =~ s/[\r\n]//g;
+            my @cols = split ( /\t/, $aline );
+            # non -d BED columns are [0]=seqid [1]=start(0-bases) [2]=end(1-based)
+            # [3]=The number of features in A that overlapped (by at least one base pair) the B interval
+            # [4]=The number of bases in B that had non-zero coverage from features in A
+            # [5]=The length of the entry in B
+            # [6]=The fraction of bases in B that had non-zero coverage from features in A
+            # but columns with -d option are
+            # non -d BED columns are [0]=seqid [1]=start(0-bases) [2]=end(1-based)
+            # [3]=base(1-based)
+            # [4]=coverage
+
+            # get sequence index
+            my $idx = $refhdrhash{$cols[0]};
+            unless ( defined $idx ) { die "Failed index lookup for reference \"$cols[0]\", BED file \"$bedfile\" line $linenum\n"; }
+
+            # store coverage data
+            $coverage[$idx]->[$cols[3]] = $cols[4];
+
+          } # while ( my $aline = <$INF> )
+        stdclose ( $INF );
+        unless ( $quiet ) { print "BED file \"$bedfile\" contained ".commify($linenum)." features\n"; }
+      } # foreach my $bedfile ( @bednames )
+  } # else parse BED files
+elsif ( @rochenames )  # parse Roche gsMapper 454PairAlign.txt files
+  {
+    unless ( $quiet ) { print "Reading Roche 454PairAlign.txt to determine coverage\n"; }
+    foreach my $rochefile ( @rochenames )
+      {
+        debugmsg ( "Processing Roche file \"$rochefile\"" );
+        my $linenum = 0;
+        my $nreads = 0;
+        my $part = -1;  # 0, 1, or 2
+        my $INF = stdopen ( "<", $rochefile );
+        my @lines;
+        while ( my $aline = <$INF> )
+          {
+            # each read occupies three lines, e.g.:
+            #>FCD05TCACXX:6:1101:1298:2085#ATCACGAT/2, 48..90 of 90 and GY14Scaffold00998, 101926..101968 of 563336   (41/44 ident)
+            #        48 TTCCACGGGTTAGGATCCAACCG-TTACAATATGTTGAAGTTTT 90
+            #    101926 TTCCACGGGTTAGGATCCAACA-ATTACAATATGTTGAAGTTTT 101968
+            $linenum++;
+            $part = ( ( $part + 1 ) % 3 );
+            unless ( $part ) { @lines = (); }  # reset
+            $aline =~ s/[\r\n]//g;
+            $lines[$part] = $aline;
+            if ( $part == 0 )
+              {
+                unless ( $aline =~ m/^>/ ) { die "Error, line $linenum does not start with \">\": \"$aline\"\n"; }
+              }
+            elsif ( $part == 2 )
+              {
+                $nreads++;
+                if ( ( ! $quiet ) and ( ( $nreads % $updateinterval ) == 0 ) )
+                  { print commify($nreads)." reads\n".$ansiup; }
+                # sequence will end up in column [2]
+                my @refcols = split ( /\s+/, $lines[2] );
+                my @readcols = split ( /\s+/, $lines[1] );
+                my $refid;
+                if ( $lines[0] =~ m/ and ([^,]+)/ )
+                  { $refid = $1; }
+                else
+                  { die "Error parsing line ".commify($linenum-2).", \"$lines[0]\"\n"; }
+
+                # get sequence index
+                my $idx = $refhdrhash{$refid};
+                unless ( defined $idx ) { die "Failed index lookup for reference \"$refid\", line ".commify($linenum)."\n"; }
+
+                # store coverage data. I will ignore SNPs and just add 1 to coverage for entire reference range
+                for my $i ( $refcols[1] .. $refcols[3] )
+                  { $coverage[$idx]->[$i]++; }
+              } # $part == 2
+
+          } # while ( my $aline = <$INF> )
+        stdclose ( $INF );
+        unless ( $quiet ) { print "Roche file \"$rochefile\" contained ".commify($nreads)." reads\n"; }
+      } # foreach my $rochefile ( @rochenames )
+  } # else parse Roche gsMapper files
+
+
+
+############################################################
+# optional wiggle file
+############################################################
+# http://genome.ucsc.edu/goldenPath/help/wiggle.html
+if ( $wspacing )
+  {
+    unless ( $quiet ) { print "Creating wiggle files at a spacing of $wspacing\n"; }
+    for my $i ( 0 .. $#refhdrkeys )
+      {
+        ( my $shortdb = $dbname ) =~ s/^.*\///;
+        my $wigglefile = $outpath . "/" . $refhdrkeys[$i] . ".vs." . $shortdb . ".wig";
+        if ( $wname )
+          {
+            if ( $wname =~ m/\// )
+              { $wigglefile = $wname; }
+            else
+              { $wigglefile = $outpath . "/" . $wname; }
+          }
+        debugmsg ( "Creating wiggle file \"$wigglefile\"" );
+        my $OUTF = stdopen ( ">", $wigglefile );
+        my $headername = $refhdrkeys[$i] . "_vs_" . $shortdb;  # default name
+        if ( $whname ) { $headername = $whname; }
+        print $OUTF "track type=wiggle_0 name=\"$headername\" description=\"Coverage by $coverageby\"\n";
+        print $OUTF "fixedStep chrom=\"$refhdrkeys[$i]\" start=1 step=$wspacing span=$wspacing\n";
+        my $cumul = 0;
+        my $tot = 0;
+        for my $j ( 1 .. $reflengths[$i] )
+          {
+            my $datum = $coverage[$i]->[$j];
+            unless ( defined $datum ) { $datum = 0 }
+            $tot += $datum;
+            $cumul++;
+            if ( $cumul >= $wspacing )
+              {
+                my $mean = sprintf ( "%0.3f", ( $tot / $cumul ) );
+                print $OUTF $mean, "\n";
+                $tot = 0;
+                $cumul = 0;
+              }
+          } # for $j
+
+        # include any left over data from a fractional increment at the end
+        if ( $cumul )
+          {
+            my $mean = sprintf ( "%0.3f", ( $tot / $cumul ) );
+            print $OUTF $mean, "\n";
+          }
+
+        stdclose ( $OUTF );
+      } # for $i
+  } # if ( $wspacing )
+
+
+
+############################################################
+# calculate optional gc ratio from reference sequences
+############################################################
+my @gcratio;
+if ( $gc )
+  {
+    # if $gc is not odd, then one more base will be in the window
+    # on the left side than the right side
+    my $leftwindow = int ( $gc / 2 );
+    my $rightwindow = ( $gc - 1 - $leftwindow );
+    for my $i ( 0 .. $#refhdrkeys )
+      {
+        my $nnt = 0;
+        # convert sequence string to array
+        my @bases = split ( //, $refsequences[$i] );
+        debugmsg ( "Reference $i $refhdrkeys[$i] has ".$#bases." bases, reflength=$reflengths[$i]" );
+
+        # make temporary cumulative total of gc count in an array
+        my $ngc = 0;
+        my @tmptotalgc;
+        for my $j ( 0 .. $#bases )
+          {
+            if ( $bases[$j-1] =~ m/[CGScgs]/ )
+              { $ngc++; }
+            elsif ( $bases[$j-1] =~ m/[KMNRYkmnry]/ )
+              { $ngc += 0.5; }
+            elsif ( $bases[$j-1] =~ m/[BVbv]/ )
+              { $ngc += (2/3); }
+            elsif ( $bases[$j-1] =~ m/[DHdh]/ )
+              { $ngc += (1/3); }
+            # and [ATWatw] count as zero
+
+            $tmptotalgc[$j] = $ngc;
+          } # for $j
+
+        # window is centered on base position
+        for my $j ( 0 .. $#bases )
+          {
+            my $start = ( $j - $leftwindow );
+            if ( $start < 0 ) { $start = 0; }
+            my $end = ( $j + $rightwindow );
+            if ( $end > $#bases ) { $end = $#bases; }
+            $gcratio[$i]->[$j+1] = ( ( $tmptotalgc[$end] - $tmptotalgc[$start] ) / ( $end - $start + 1 ) );
+          } # for $j
+
+      } # for $i
+  } # if ( $gc )
+
+
+
+############################################################
+# find tracts of N's
+############################################################
+my @Ncoords;
+if ( $shown )
+  {
+    for my $i ( 0 .. $#refhdrkeys )
+      {
+        while ( $refsequences[$i] =~ m/(N{$shown,})/ig )
+          {
+            my $end = pos($refsequences[$i]);
+            my $start = $end - length($1) + 1;
+            debugmsg ( "Tract of N's in reference $i $refhdrkeys[$i]: Start=$start end=$end" );
+            push ( @{$Ncoords[$i]}, $start, $end );  # two elements per span, start and end, 1-based
+          }
+      } # for $i
+  } # if $shown
+
+
+
+############################################################
+# optional ORFs detection
+############################################################
+if ( $showorfs )
+  {
+    unless ( $quiet ) { print "Detecting ORFs\n"; }
+    # generate table of orfs using bb.orffinder
+    foreach my $aref ( @referencenames )
+      {
+        my ($TMPORF, $tmporf) = tempfile($tempfiletemplate, TMPDIR=>1, UNLINK=>1);
+        debugmsg ( "Caculating ORFs in reference file \"$aref\", output=\"$tmporf\"" );
+        my $cmd = "bb.orffinder --infile=\"$aref\" --outfile=\"$tmporf\"";
+        unless ( $quiet ) { print "COMMAND: $cmd\n"; }
+        my $result = system ( $cmd );
+        if ( $result ) { die "Error $result running command \"$cmd\"\n"; }
+
+        # parse orfs file and create gnuplot data
+        while ( my $aline = <$TMPORF> )
+          {
+            $aline =~ s/[\r\n]//g;
+            next if ( $aline =~ m/^#/ );
+            my @cols = split ( /\t/, $aline );
+            # [0]#ID [1]orf [2]Frame [3]Start [4]Codon [5]Stop [6]Codon [7]Length
+            my $y1pos = ( ( $cols[2] - 0.4 ) / 100 ) + $showorfs;
+            my $y2pos = ( ( $cols[2] + 0.4 ) / 100 ) + $showorfs;
+            $orfdata .= "set obj ".++$objcounter." rect from first $cols[3],graph $y1pos to first $cols[5],graph $y2pos fs solid 1.0 fc rgb \"$orfcolor[$cols[2]+3]\"\n";
+          }
+        close $TMPORF;
+
+      } # foreach $aref
+  } # if ( $showorfs )
+
+
+
+############################################################
+# create a graph from stored data
+############################################################
+unless ( $noimage )
+  {
+for my $i ( 0 .. $#refhdrkeys )
+  {
+    # --grep filtering
+    my $skip = 0;
+    if ( @greps )
+      {
+        $skip = 1;
+        foreach my $grep ( @greps )
+          { if ( $refhdrkeys[$i] eq $grep ) { $skip = 0; last; } }
+      }
+    next if ( $skip );
+
+    ( my $shortdb = $dbname ) =~ s/^.*\///;
+    my $datafile =           $outpath . "/" . $refhdrkeys[$i] . ".vs." . $shortdb . ".data";
+#    my $markerfile =         $outpath . "/" . $refhdrkeys[$i] . ".vs." . $shortdb . ".markers";
+    my $shownfile =          $outpath . "/" . $refhdrkeys[$i] . ".vs." . $shortdb . ".Ns";
+    my $imagefile =          $outpath . "/" . $refhdrkeys[$i] . ".vs." . $shortdb . "." . $format;
+    if ( $image ) { $imagefile = $outpath . "/" . $refhdrkeys[$i] . ".vs." . $image . "." . $format; }
+    my $thumbnailimagefile = $outpath . "/" . $refhdrkeys[$i] . ".vs." . $shortdb . ".tn." . $format;
+    if ( $image ) { $thumbnailimagefile = $outpath . "/" . $refhdrkeys[$i] . ".vs." . $image . ".tn." . $format; }
+    my ($OUTG, $gnuplotcmdfile) = tempfile($tempfiletemplate, TMPDIR=>1, UNLINK=>1);
+    debugmsg ( "Key index $i: data=\"$datafile\", image=\"$imagefile\", thumbnail=\"$thumbnailimagefile\", gpcommand=\"$gnuplotcmdfile\"" );
+    my $markerlabeloffset = 0;
+
+    # create data file for gnuplot, and find maximum
+    my $maxcov = 0;
+    my $totcov = 0;
+    my $OUTF = stdopen ( ">", $datafile );
+    for my $j ( ($leftcrop+1) .. ($reflengths[$i]-$rightcrop) )
+      {
+        my $datum = $coverage[$i]->[$j];
+        unless ( defined $datum ) { $datum = 0 }
+
+        # filled curves leaves gap if exceeds y axis maximum, this will fix it
+        if ( ( $ymax ) and ( $datum > $ymax ) ) { $datum = $ymax; }
+
+        print $OUTF ($j-$leftcrop), "\t", $datum;
+        if ( $gc ) { print $OUTF "\t", ($gcratio[$i]->[$j] * 100); }
+
+        # experimental transform based on gc
+        if ( $transform )
+          {
+            my $t = $gcratio[$i]->[$j];
+            # scale based on gc so that gc of <=0.4 = 1x and 0.5 = 2x of original value
+            if ( $t >= 0.4 )
+              {
+                $datum = ( $datum * ( 1 + ($t-0.4)*(1/(0.5-0.4)) ) );
+              }
+            print $OUTF "\t", $datum;
+          } # transform
+
+        print $OUTF "\n";
+        if ( $datum > $maxcov ) { $maxcov = $datum }
+        $totcov += $datum;
+      } # for $j
+    stdclose ( $OUTF );
+
+    # if --xscale was specified, override --xsize with this
+    if ( $xscale )
+      {
+        $xsize = int ( ( $xscale * $reflengths[$i] ) / 1000 + 0.5 );
+        debugmsg ( "Calculated --xsize = $xsize" );
+      }
+
+    # create gnuplot command file
+    $objcounter = 0;
+    print $OUTG "set terminal $format size $xsize,$ysize font \"$font\"\n";
+    # background color just in plot area
+    print $OUTG "set output \"$imagefile\"\n";
+    print $OUTG "set obj ",++$objcounter," rect from graph 0,0 to graph 1,1 fs solid 1.0 fc rgb \"$plotareabg\" behind\n";
+    print $OUTG "set datafile separator \"\t\"\n";
+    print $OUTG "set tics front\n";
+    my $mp = 0;
+    if ( $gc ) { $mp ++; }
+    if ( $transform ) { $mp ++; }
+    if ( $mp )
+      {
+        print $OUTG "set tmargin 0.1\n";
+        print $OUTG "set bmargin 0\n";
+        print $OUTG "set lmargin 15\n";
+        print $OUTG "set rmargin 1\n";
+        print $OUTG "set multiplot layout ".($mp+2).",1";
+        if ( defined $title )
+          {
+            if ( $title )
+              { print $OUTG " title \"$title\""; }
+            else
+              { print $OUTG ""; }
+          }
+        else
+          { print $OUTG " title \"$refhdrkeys[$i]\""; }
+        print $OUTG " offset 0,-0.025\n";  # title is too low for some reason
+      }
+    else # not $mp
+      {
+        if ( defined $title )
+          {
+            if ( $title )
+              { print $OUTG "set title \"$title\""; }
+          }
+        else
+          { print $OUTG "set title \"$refhdrkeys[$i]\""; }
+        print $OUTG "\n";
+      }
+    my $plotymax=$ymax?$ymax:($maxcov + 5);
+    my $xlen = ( $reflengths[$i] - $leftcrop - $rightcrop );
+    if ( defined $xmax ) { $xlen = $xmax; }
+    print $OUTG "set xrange [$xmin:$xlen]\n";
+    print $OUTG "set xlabel \"$xlabel\"\n";
+#    if ( $gc ) { print $OUTG "set y2label \"Percent GC\"\n"; }
+    print $OUTG "set style line 1 linetype 2 linewidth 1 linecolor rgb \"black\"\n";
+    print $OUTG "set style line 2 linetype 1 linewidth 1 linecolor rgb \"black\"\n";
+    print $OUTG "set style line 3 linetype 1 linewidth 1 linecolor rgb \"red\"\n";
+    print $OUTG "set style line 4 linetype 1 linewidth 1 linecolor rgb \"black\"\n";  # marker
+    print $OUTG "set style line 5 linetype 1 linewidth 10 linecolor rgb \"goldenrod\"\n";  # tracts of N's
+    if ( $fill ) { print $OUTG "set style line 6 linetype 1 linewidth 1 linecolor rgb \"$fill\"\n"; }  # fill color B0E0E6=powder blue
+    my $labely = sprintf ( "%1d", ( $plotymax * .95 ) );
+    my $avgcov = sprintf ( "%0.1f", ( $totcov / $reflengths[$i] ) );
+    unless ( $nointlabel )
+# bug, average coverage is wrong if any data point goes off scale, so quick fix is don't print this value any more
+#      { print $OUTG "set label \"Reference length = ".commify($xlen)." nt, Average coverage = $avgcov\" at 5,$labely\n"; }
+      { print $OUTG "set label \"Reference length = ".commify($xlen)." nt\" at 5,$labely\n"; }
+
+    # insert marker labels if specified
+    if ( ( @markers ) or ( defined $refhdrkeys[$i] and $persequencemarkers{$refhdrkeys[$i]} ) )
+      {
+        print $OUTG "set style rect fs solid noborder\n";
+#        print $OUTG "set style arrow nohead\n";
+        foreach my $amarker ( @markers, @{$persequencemarkers{$refhdrkeys[$i]}} )
+          {
+            my @cols = split ( /[,;:]/, $amarker );
+            my @startend = split( /\.\./, $cols[0] );
+            my $color = ( $cols[2] // $defaultmarkercolor );
+            $objcounter++;
+            if ( defined $startend[1] )  # vertical rectangle
+              {
+                print $OUTG "set obj $objcounter rect from $startend[0], graph 0 to $startend[1], graph 1",
+                            " fc rgb \"$color\" behind\n";
+                if ( $cols[1] )  # labels are optional, skip if none
+                  {
+                    my $markerlabelx = ( $startend[0] + $startend[1] ) / 2;
+#                    my $markerlabely = sprintf ( "%1d", ( $plotymax * ( .90 - (0.05 * $markerlabeloffset) ) ) );
+                    print $OUTG "set label $objcounter \"$cols[1]\" at $markerlabelx,graph $markerlabelheight front center\n";
+                    if ( $markerlabelstagger ) { $markerlabeloffset = ( ( $markerlabeloffset + 1 ) % $markerlabelstagger ); }
+                  }
+              }
+            else  # vertical line
+              {
+                print $OUTG "set arrow $objcounter from $startend[0], graph 0 to $startend[0], graph 1",
+                            " nohead lc rgb \"$color\"\n";
+                if ( $cols[1] )  # labels are optional, skip if none
+                  {
+                    my $markerlabelx = $startend[0];
+                    my $markerlabely = sprintf ( "%1d", ( $plotymax * ( .90 - (0.05 * $markerlabeloffset) ) ) );
+                    print $OUTG "set label $objcounter \"$cols[1]\" at $markerlabelx,$markerlabely front\n";
+                    if ( $markerlabelstagger ) { $markerlabeloffset = ( ( $markerlabeloffset + 1 ) % $markerlabelstagger ); }
+                  }
+              }
+          }
+      } # marker labels
+
+    print $OUTG $orfdata;
+
+    my $title1 = "";
+    if ( $gc ) { $title1 = "Coverage"; }
+    print $OUTG "set yrange [$ymin:$plotymax]\n";
+    print $OUTG "set ylabel \"Read Coverage\"\n";
+
+    print $OUTG "set tics scale 3,1\n";
+    if ( $gc )
+      { print $OUTG "unset xtics\n"; }
+    else
+      {
+        if ( $xtics ) { print $OUTG "set xtics $xtics\n"; }
+        if ( $mxtics ) { print $OUTG "set mxtics $mxtics\n"; }
+        print $OUTG "set xtics out nomirror\n";
+      }
+    print $OUTG "set ytics out mirror\n";
+    print $OUTG "set ytics border", $gc?" nomirror":" mirror", "\n";
+
+    print $OUTG "plot ";
+    print $OUTG "\"$datafile\" using 1:2 with";
+    if ( $fill )
+      { print $OUTG " filledcurves x1 ls 6 axis x1y1 notitle"; }
+    else
+      {
+        print $OUTG " lines ls 1 axis x1y1";
+        if ( $nolegend )
+          { print $OUTG " notitle"; }
+        else
+          { print $OUTG " title \"$title1\""; }
+      }
+    if ( $fill )
+      {
+        print $OUTG ",\\\n\"$datafile\" using 1:2 with lines ls 1 axis x1y1";
+        if ( $nolegend )
+          { print $OUTG " notitle"; }
+        else
+          { print $OUTG " title \"$title1\""; }
+      }
+
+    if ( $shown )
+      { print $OUTG ",\\\n\"$shownfile\" using 1:2 with lines ls 5 axis x1y1 notitle"; }
+
+    print $OUTG "\n";
+
+    if ( $gc )
+      {
+        print $OUTG "unset label\n";
+        print $OUTG "set yrange [0:100]\n";
+        print $OUTG "set ytics 0,25,75\n";
+        print $OUTG "set ylabel \"Percent GC\"\n";
+        if ( $xtics ) { print $OUTG "set xtics $xtics\n"; }
+        if ( $mxtics ) { print $OUTG "set mxtics $mxtics\n"; }
+        print $OUTG "set xtics out nomirror\n";
+        print $OUTG "plot \"$datafile\" using 1:3 with lines ls 2 axis x1y1";
+        if ( $nolegend )
+          { print $OUTG " notitle\n"; }
+        else
+          { print $OUTG " title \"Percent GC\"\n"; }
+      }
+    if ( $transform )
+      {
+        print $OUTG "unset label\n";
+        print $OUTG "set yrange [$ymin:$plotymax]\n";
+        print $OUTG "set ylabel \"Read Coverage\"\n";
+        print $OUTG "plot \"$datafile\" using 1:4 with lines ls 3 axis x1y1";
+        if ( $nolegend ) 
+          { print $OUTG " notitle\n"; }
+       	else
+          { print $OUTG " title \"Adjusted Coverage\"\n"; }
+      }
+    if ( $mp ) { print $OUTG "set nomultiplot\n"; }
+    close( $OUTG );
+    if ( $debug ){ system( "cat \"$gnuplotcmdfile\"" ); }
+
+#    # create marker file if any markers specified
+#    if ( ( @markers ) or ( defined $refhdrkeys[$i] and $persequencemarkers{$refhdrkeys[$i]} ) )
+#      {
+#        my $OUTF = stdopen ( ">", $markerfile );
+#        foreach my $amarker ( @markers, @{$persequencemarkers{$refhdrkeys[$i]}} )
+#          {
+#            my @cols = split ( /[,;:]/, $amarker );  # to remove optional label
+#            print $OUTF join ( "\t", $cols[0], 0 ), "\n";
+#            print $OUTF join ( "\t", $cols[0], $plotymax ), "\n";
+#            print $OUTF "\n";
+#          }
+#        stdclose ( $OUTF );
+#      }
+
+    # create shown file if --shown defined
+    if ( $shown )
+      {
+        my $OUTF = stdopen ( ">", $shownfile );
+        if ( defined $Ncoords[$i] )
+          {
+            for ( my $j=0; $j<scalar @{$Ncoords[$i]}; $j+=2 )
+              {
+                print $OUTF join ( "\t", $Ncoords[$i]->[$j], 1 ), "\n"; 
+                print $OUTF join ( "\t", $Ncoords[$i]->[$j+1], 1 ), "\n";
+                print $OUTF "\n";
+              }
+          }
+        else
+          { debugmsg ( "No tracts of N's defined for i=$i \"$refhdrkeys[$i]\"" ); }
+        stdclose ( $OUTF );
+      }
+
+    # run gnuplot
+    $ENV{'GDFONTPATH'} .= ":$fontpath"; 
+    my $cmd = $gnuplotcmd;
+    $cmd .= " \"$gnuplotcmdfile\"";
+    unless ( $quiet ) { print "COMMAND: $cmd\n"; }
+    my $result = system ( $cmd );
+    if ( $result ) { die "Error $result returned from command \"$cmd\"\n"; }
+
+    # create optional thumbnail
+    if ( $thumbnail )
+      {
+        unless ( $quiet ) { print "Creating thumbnail image at $thumbnail\% reduction\n"; }
+        my $tncmd = $resizecmd;
+        $tncmd .= " -resize ${thumbnail}\%";
+        $tncmd .= " \"$imagefile\"";
+        $tncmd .= " \"$thumbnailimagefile\"";
+        debugmsg ( "thumbnail command is \"$tncmd\"" );
+        unless ( $quiet ) { print "COMMAND: $cmd\n"; }
+        my $tnresult = system ( $tncmd );
+        if ( $tnresult ) { die "Error $tnresult returned from command \"$tncmd\"\n"; }
+      } # if ( $thumbnail )
+
+    # optional append HTML code
+    if ( $htmlname )
+      {
+        ( my $imageurl = $imagefile ) =~ s/^.*\///;
+        ( my $thumbnailurl = $thumbnailimagefile ) =~ s/^.*\///;
+        # BUG this is not reliable, prefix url with $outpath
+        $imageurl = $outpath . $imageurl;
+        $thumbnailurl = $outpath . $thumbnailurl;
+        my $HTML = stdopen ( ">>", $htmlname );
+        print $HTML "    <li>$refhdrkeys[$i]<br>\n";
+        if ( $thumbnail )
+          { print $HTML "        <a href=\"$imageurl\"><img src=\"$thumbnailurl\" border=\"0\"></a><br>\n"; }
+        else  # no thumbnail
+          { print $HTML "        <img src=\"$thumbnailurl\" border=\"0\"><br>\n"; }
+        print $HTML "        &nbsp;</li>\n";
+        close $HTML;
+      } # if ( $htmlname )
+
+  } # for $i
+  } # unless ( $noimage )
+
+
+
+############################################################
+# remove intermediate temporary files, unless cached
+############################################################
+if ( $cachename eq $tmpdir )
+  {
+    unless ( $quiet ) { print "Removing temporary files\n"; }
+    unless ( $permanentdb )
+      {
+        if ( $dbnamewithpath =~ m/\/home\/blastdb/ ) { die "Bug, trying to delete a permanent database!\n"; }
+        unlink ( $dbnamewithpath );  # concatenated raw read FASTA file
+        unlink ( glob $dbnamewithpath.'.n*' );     # compiled blast database
+        unlink ( glob $dbnamewithpath.'.??.n*' );  # compiled blast database
+      }
+  } # if ( $cachename eq $tmpdir )
+
+
+unless ( $quiet ) { print "Program completed\n"; }
+exit 0;
+
+
+
+############################################################
+sub bowtie2 { my ( $bam ) = @_;
+############################################################
+  my $refindex = 0;
+  foreach my $ref ( @referencenames )
+    {
+      $refindex++;
+      my $extra = "";
+      # intermediate file names
+      my $localbam = $bam;
+      if ( ( scalar @referencenames ) > 1 )
+        {
+          $extra = $refindex . ".";
+          $localbam =~ s/bam$/${extra}bam/;
+        }
+      ( my $sam = $localbam ) =~ s/bam$/sam/;
+      if ( $sam eq $localbam ) { $sam .= ".sam"; }
+      ( my $unsortedbam = $localbam ) =~ s/bam$/unsorted.bam/;
+      if ( $unsortedbam eq $localbam ) { $unsortedbam .= ".unsorted"; }
+      my $refid = $ref; # ) =~ s/\.[^\.]+$//;  # remove extension if there is one
+      my $reffai = $ref . ".fai";
+
+      # reference index. Lots of output, so make separate log file for this step
+      if ( ( ! -s "$refid.bt.2" ) or ( -M "$refid.bt.2" > -M $ref ) )
+        {
+          ( my $refnopath = $refid ) =~ s/^.*\///;
+          my $log = "bb.coverage.$refnopath.bowtieindexinglog";
+          unless ( $quiet ) { print "Creating reference index file \"$refid.bt.2\", log file is \"$log\"\n"; }
+          my $cmd = "bowtie2-build";
+          $cmd .= " \"$ref\"";
+          $cmd .= " \"$refid\"";
+          $cmd .= " &> \"$log\"";
+          unless ( $quiet ) { print "COMMAND: $cmd\n"; }
+          my $result = system ( $cmd );
+          if ( $result ) { die "Error $result executing command \"$cmd\"\n"; }
+        }
+
+      # reference index
+      if ( ( ! -s $reffai ) or ( -M $reffai > -M $ref ) )
+        {
+          unless ( $quiet ) { print "Creating reference index file \"$reffai\"\n"; }
+          my $cmd = "samtools";
+          $cmd .= " faidx";
+          $cmd .= " \"$ref\"";
+          unless ( $quiet ) { print "COMMAND: $cmd\n"; }
+          my $result = system ( $cmd );
+          if ( $result ) { die "Error $result executing command \"$cmd\"\n"; }
+        }
+
+      # bowtie2
+      # skip intermediate steps if bam file exists
+      if ( ( ! -s $localbam ) or ( -M $localbam > -M $ref ) )
+        {
+
+      # create sam file
+      if ( ( ! -s $sam ) or ( -M $sam > -M $ref ) )
+        {
+          unless ( $quiet ) { print "Creating sam file \"$sam\"\n"; }
+          my $rdformat = "f";
+          if ( scalar @fastqnames ) { $rdformat = "q"; }
+          my $cmd = "bowtie2";
+          $cmd .= " -x \"$ref\"";
+          $cmd .= " -a";
+
+# for now, if two files assume paired end, any other number is shotgun. Need to somehow fix this bug
+          my $nadded = 0;
+          if ( ( scalar @fastanames ) != 2 )
+            {
+              foreach my $f ( @fastanames )
+                { $cmd .= " -U \"$f\""; $nadded++; }
+            }
+          if ( ( scalar @fastqnames ) != 2 )
+            {
+              foreach my $f ( @fastqnames )
+                { $cmd .= " -U \"$f\""; $nadded++; }
+            }
+          if ( ( scalar @fastanames ) == 2 )
+            {
+              $cmd .= " -1 \"$fastanames[0]\""; $nadded++;
+              $cmd .= " -2 \"$fastanames[1]\""; $nadded++;
+            }
+          if ( ( scalar @fastqnames ) == 2 )
+            {
+              $cmd .= " -1 \"$fastqnames[0]\""; $nadded++;
+              $cmd .= " -2 \"$fastqnames[1]\""; $nadded++;
+            }
+          unless ( $nadded == ( ( scalar @fastanames ) + ( scalar @fastqnames ) ) )
+            { die "Program bug with number of read files\n"; }
+
+          $cmd .= " -$rdformat";  # input files format, f or q
+          $cmd .= " --sensitive";
+          $cmd .= " --threads=$numcpu";
+          $cmd .= " --no-unal";  # available with bowtie2 beta 6 and above
+          $cmd .= " > \"$sam\"";
+          debugmsg ( "Bowtie2 command is \'$cmd\'" );
+          my $result = system ( $cmd );
+          if ( $result ) { die "Error $result executing command \"$cmd\"\n"; }
+        } # if sam file does not exist
+
+      # sam -> bam
+      if ( ( ! -s $unsortedbam ) or ( -M $unsortedbam > -M $sam ) )
+        {
+          unless ( $quiet ) { print "Creating bam file \"$unsortedbam\"\n"; }
+          my $cmd = "samtools";
+          $cmd .= " view";
+          $cmd .= " -bS \"$sam\"";
+          $cmd .= " -t \"$reffai\"";
+          $cmd .= " > \"$unsortedbam\"";
+          unless ( $quiet ) { print "COMMAND: $cmd\n"; }
+          my $result = system ( $cmd );
+          if ( $result ) { die "Error $result executing command \"$cmd\"\n"; }
+        }
+
+      # sorted bam
+      if ( ( ! -s $localbam ) or ( -M $localbam > -M $unsortedbam ) )
+        {
+          ( my $bamnoext = $localbam ) =~ s/\.bam$//;  # this step always adds an additional .bam extension
+          unless ( $quiet ) { print "Sorting bam to file \"$localbam\"\n"; }
+          my $cmd = "samtools";
+          $cmd .= " sort";
+          $cmd .= " -m $samtoolssortmem";
+          $cmd .= " \"$unsortedbam\"";
+          $cmd .= " \"$bamnoext\"";
+          unless ( $quiet ) { print "COMMAND: $cmd\n"; }
+          my $result = system ( $cmd );
+          if ( $result ) { die "Error $result executing command \"$cmd\"\n"; }
+        }
+
+        } # skip intermediate steps if bam file exists
+
+      # bam index, not needed here but may be useful downstream
+      if ( ( ! -s "$localbam.bai" ) or ( -M "$localbam.bai" > -M $localbam ) )
+        {
+          ( my $bamnoext = $localbam ) =~ s/\.bam$//;  # this step always adds an additional .bam extension
+          unless ( $quiet ) { print "Indexing bam file \"$localbam\"\n"; }
+          my $cmd = "samtools";
+          $cmd .= " index";
+          $cmd .= " \"$localbam\"";
+          unless ( $quiet ) { print "COMMAND: $cmd\n"; }
+          my $result = system ( $cmd );
+          if ( $result ) { die "Error $result executing command \"$cmd\"\n"; }
+        }
+
+    } # for $ref
+  
+} # sub bowtie2
+
+
+
+############################################################
+sub debugmsg { my ( $text, $noreturn, $nolinenum ) = @_;
+############################################################
+  if ( $debug )
+    {
+      my ($package, $filename, $line, $sub) = caller(0);
+      unless ( $nolinenum ) { $text = "Line $line: " . $text; }
+      if ( ! ( $noreturn ) ) { $text .= "\n"; }
+      print $text;
+    } # if ( $debug )
+} # sub debugmsg
+
+
+
+###############################################################
+sub timestr {
+###############################################################
+  @_ = localtime(shift || time);
+  return(sprintf("%04d/%02d/%02d %02d:%02d", $_[5]+1900, $_[4]+1, $_[3], @_[2,1]));
+} # sub timestr
+
+
+
+###############################################################
+sub commify {
+###############################################################
+# http://perldoc.perl.org/perlfaq5.html#How-can-I-output-my-numbers-with-commas
+  local $_ = shift;
+  1 while s/^([-+]?\d+)(\d{3})/$1,$2/;
+  return $_;
+} # commify
+
+
+
+###############################################################
+sub stdopen { my ( $mode, $filename, $extratext ) = @_;
+###############################################################
+# a replacement for the three-parameter open which also allows
+# the use of "-" as the file name to mean STDIN or STDOUT
+  my $fh;  # the file handle
+  if ( $filename eq "-" )  # only exact match to "-" has special meaning
+    {
+      if ( $mode =~ m/>/ )
+        { $fh = *STDOUT }
+      else
+        { $fh = *STDIN }
+    }
+  else
+    {
+      # supplemental passed text for error messages, need one more space
+      if ( defined $extratext )
+        { $extratext .= " " }
+      else
+        { $extratext = "" }
+
+      my $text;  # this is only used for error message
+      if ( $mode =~ m/^\+?>>/ )  # ">>" or "+>>"
+        { $text = "append" }
+      elsif ( $mode =~ m/^\+?>/ )  # ">" or "+>"
+        { $text = "output" }
+      elsif ( $mode =~ m/^\+?</ )  # "<" or "+<"
+        { $text = "input" }
+      elsif ( $mode eq "-|" )
+        { $text = "piped input" }
+      elsif ( $mode eq "|-" )
+        { $text = "piped output" }
+      else
+        { die "Error, unsupported file mode \"$mode\" specified to stdopen( $mode, $filename, $extratext )\n"; }
+
+      # if file name ends in ".gz", gzip compression is assumed, and handle it transparently
+      if ( $filename =~ m/\.gz$/ )
+        {
+          if ( $mode =~ m/^>$/ ) # output mode
+            { $mode = "|-"; $filename = "gzip -c > \"$filename\""; }
+          elsif ( $mode =~ m/^<$/ ) # input mode
+            { $mode = "-|"; $filename = "gunzip -c \"$filename\""; }
+          else
+            { die "Error, can't handle gzip compression with mode \"$mode\" for file \"filename\"\n"; }
+        } # if gzip compressed file
+      open ( $fh, $mode, $filename ) or die ( "Error opening ${extratext}file \"$filename\" for $text: $!\n" );
+    }
+  # return the opened file handle to the caller
+  return $fh;
+} # stdopen
+
+
+
+###############################################################
+sub stdclose { my ( $fh ) = @_;
+###############################################################
+# same as built-in close, except in case of STDIN or STDOUT,
+# and in this case the file handle is not closed
+
+  unless ( fileno($fh) <= 2 )  # if file number is this low, is stdin or stdout or stderr
+    { close ( $fh ) or die ( "Error closing file handle: $!\n" ); }
+
+} # sub stdclose
+
+
+
+# eof
