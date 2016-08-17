@@ -12,9 +12,57 @@ pipe to reverse complement a raw sequence stream
 
 
 my @stream = <>;
-my $rc = revcomp ( join ( '', @stream ) );
+my $rc = revcompfasta ( join ( '', @stream ) );
 print $rc;
 exit 0;
+
+
+
+############################################################
+sub revcompfasta { my ( $dna ) = @_;
+############################################################
+# if stream is in fasta format, split on headers and only
+# reverse complement the sequence. If in raw format, entire
+# stream is reverse complemented
+  my @lines = split( /[\n\r]+/, $dna );
+  my $tmpseq = '';
+  my $outseq = '';
+  my $wasfasta = 0;
+  foreach my $aline ( split( /[\n\r]+/, $dna ) )
+    {
+      if ( $aline =~ m/^>/ )
+        {
+          if ( $tmpseq )
+            {
+              my $tmp = revcomp( $tmpseq );
+              $tmp =~ s/^\n+//;
+              $tmp =~ s/\n+$//;
+              $outseq .= $tmp;
+              $tmpseq = '';
+            }
+          if ( $outseq )
+            { $outseq .= "\n"; }
+          $outseq .= $aline . "rc\n";
+          $wasfasta = 1;
+        }
+      else
+        {
+          if ( $tmpseq )
+            { $tmpseq .= "\n"; }
+          $tmpseq .= $aline;
+        }
+    }
+  if ( $tmpseq )
+    {
+      my $tmp = revcomp( $tmpseq );
+      $tmp =~ s/^\n+//;
+      $tmp =~ s/\n+$//;
+      $outseq .= $tmp;
+      # no return at end of final sequence unless was in fasta format
+      if ( $wasfasta ) { $outseq .= "\n"; }
+    }
+  return( $outseq );
+} # sub revcompfasta
 
 
 
