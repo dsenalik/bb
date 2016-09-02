@@ -151,7 +151,7 @@ bb.revcomp
 
 A very simple pipe to reverse complement a raw sequence stream
 e.g. echo "ACTG" | bb.revcomp
-outputs "CAGT"
+outputs "CAGT", or it can also handle a stream in fasta format
 
 bb.scaftigs
 -----------
@@ -159,6 +159,16 @@ bb.scaftigs
 This program will return all portions of a final assembly consisting of
 contiguous sequence, with sequences split at every occurrence of gaps of
 unknown bases (Ns)
+
+bb.softclip
+-----------
+
+This program analyzes a bam file of mapped reads to detect regions where
+a significant fraction of the reads are consistently softclipped. These can
+be due to differences from the reference sequence or misassembly in the reference
+sequence. An example of a misassembly visualized in IGV, with the
+"Show soft-clipped bases" option enabled.
+![misassembly example image for bb.softclip](https://github.com/dsenalik/bb/blob/master/bb.softclip.example.png)
 
 bb.tassel
 ---------

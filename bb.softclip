@@ -1,0 +1,581 @@
+#!/usr/bin/perl
+#----------------------------------------------------------#
+#        Author: Douglas Senalik dsenalik@wisc.edu         #
+#----------------------------------------------------------#
+# "Black Box" program series
+# version 1.0 - September 2, 2016
+=bb
+Analysis of softclipped reads in a sam or bam file
+=cut bb
+use strict;
+use warnings;
+use Getopt::Long;      # for getting command line parameters
+use Bio::DB::Sam;
+
+
+
+############################################################
+# configuration variables
+############################################################
+my $defaultkmer = 10;
+my $defaultstartdepth = 10;
+my $defaultenddepth = 3;
+my $defaultmaxaltdepth = 0.5;
+my $defaultflanklength = 100;
+my $defaultspan = 1;
+my $progress = 1_000_000;  # progress update interval
+my $defaultminbreaklen = 1;
+
+
+
+############################################################
+# global variables
+############################################################
+my $ansiup    = "\033[1A";  # terminal control
+(my $prognopath = $0) =~ s/^.*[\/\\]//;
+
+
+
+############################################################
+# command line parameters
+############################################################
+my $bam;                 # input sam or bam file name
+my $reference;           # reference fasta for read mapping
+my $outfilename;         # output table file name
+my $break;               # output fasta file name
+my $kmer         = $defaultkmer;  # kmer size for softclip grouping
+my $startdepth   = $defaultstartdepth;  # softclip read depth filter
+my $enddepth     = $defaultenddepth;  # softclip read depth filter
+my $edge;
+my $maxaltdepth  = $defaultmaxaltdepth;
+my $misassembly;
+my $minbreaklen  = $defaultminbreaklen;
+my $span         = $defaultspan;
+my $flanklength  = $defaultflanklength;
+my $noheader;
+my $help         = 0;    # print help and exit
+my $quiet        = 0;    # only show errors
+my $debug        = 0;    # print extra debugging information
+GetOptions (
+            "bam=s"          => \$bam,               # string
+            "reference=s"    => \$reference,         # string
+            "outfile=s"      => \$outfilename,       # string
+            "break=s"        => \$break,             # string
+            "minbreak=i"     => \$minbreaklen,       # integer
+            "enddepth=i"     => \$enddepth,          # integer
+            "edge=i"         => \$edge,              # integer
+            "flanklength=i"  => \$flanklength,       # integer
+            "kmer=i"         => \$kmer,              # integer
+            "maxaltdepth=s"  => \$maxaltdepth,       # string (real)
+            "misassembly=s"  => \$misassembly,       # string (real)
+            "span=i"         => \$span,              # integer
+            "startdepth=i"   => \$startdepth,        # integer
+            "noheader"       => \$noheader,          # flag
+            "help"           => \$help,              # flag
+            "quiet"          => \$quiet,             # flag
+            "debug"          => \$debug);            # flag
+unless ( ( $bam ) and ( $reference ) and ( $outfilename ) ) { $help = 1 }
+# debug implies not quiet
+if ( $debug ) { $quiet = 0; }
+if ( ( $outfilename ) and ( $outfilename eq "-" ) ) { $quiet = 1 }
+
+
+
+############################################################
+# print help screen
+############################################################
+if ( $help )
+  {
+    print "$prognopath
+This program will analyze softclipped reads in a bam file.
+Softclipped reads, if appearing consistently in all or a significant
+fraction of the reads, can be caused by sequence difference between
+the mapped reads and the reference, or may indicate a misassembly in
+the reference sequence.
+
+Required parameters:
+  --bam=xxx         input bam file name
+  --reference=xxx   reference fasta file
+  --outfile=xxx     output text file name, tab-delimited
+                    any file can be .gz compressed
+
+Optional parameters:
+  --kmer=xxx        kmer size for grouping, default=$defaultkmer
+  --startdepth=xxx  integer, minimum number of reads beyond kmer needed
+                    to report a softclip, default=$defaultstartdepth
+  --enddepth=xxx    integer, minumum number of reads to extend a softclip,
+                    default=$defaultenddepth
+  --edge=xxx        integer, ignore softclips within this distance of either
+                    end of the reference sequence, default is no filtering
+  --maxaltdepth=xxx real, maximum fraction of read depth that an alternate
+                    base can reach before terminating softclip with 'N'
+                    indicator, default=$defaultmaxaltdepth
+  --flanklength=xxx length of flanking reference sequence to include in
+                    results, default=$defaultflanklength
+  --noheader        omit the header line from the output file
+  --misassembly=xxx real, turns on misassembly detection, the value is
+                    fraction of reads softclipped across --span distance,
+                    this option increases run time
+  --span=xxx        integer, span used for misassembly detection,
+                    default=$defaultspan                    
+  --break=xxx       optional output fasta file with sequences divided at
+                    each misassembly point (requires --misassembly)
+  --minbreak=xxx    integer, sequences shorter than this will not be saved
+                    to the --break file, default=$defaultminbreaklen
+  --help            print this screen
+  --quiet           only print error messages
+  --debug           print extra debugging information
+";
+    exit 1;
+  } # if ( $help )
+
+
+
+############################################################
+# main processing loop
+############################################################
+unless ( $quiet ) { print "Loading reference\n"; }
+my @seq = loadfasta( $reference, 1 );
+my %seqidx = %{indexfasta( \@seq, 1 )};
+
+# if Picard index exists and samtools index does not, create a temporary symlink
+my $tempsymlink = picardindex( $bam );
+
+unless ( $quiet ) { print "Loading bam file\n"; }
+my $sam = Bio::DB::Sam->new( -bam => $bam, -fasta => $reference, -autoindex => 1 );
+
+my @targets = $sam->seq_ids;
+unless ( $quiet ) { print "Will analyze ".commify(scalar @targets)." sequence identifiers\n"; }
+
+my $OUTF = stdopen ( ">", $outfilename );
+my $BRKF;
+if ( $break ) { $BRKF = stdopen ( ">", $break ); }
+unless ( $noheader )
+  { print $OUTF join( "\t", "Target", "Position", "Direction", "Starting_Depth", "Ending_Depth",
+                            "Left_Softclip", "Reference", "Right_Softclip" ), "\n"; }
+
+my $totalalignments = 0;
+for my $atarget ( @targets )
+  {
+    unless ( $quiet ) { print "Analyzing target \"$atarget\"\n"; }
+    my @alignments = $sam->get_features_by_location( -seq_id => $atarget );
+    my $targetlength = length( $seq[$seqidx{$atarget}]->{seq} );
+    $totalalignments += scalar( @alignments );
+    my %leftsc;
+    my %rightsc;
+    my @refspan;  # for --misassembly detection, "good" coverage
+    my @scspan;   # for --misassembly detection, "soft clip" coverage
+    my @outlines;
+    my $nalignments = 0;
+    for my $alignment ( @alignments )
+      {
+        $nalignments++;
+        unless ( $quiet )
+          {
+            if ( ( $nalignments % $progress ) == 0 )
+              { print '  ', commify($nalignments), " alignments\n"; }
+          }
+
+        # first filter is to require a softclip
+        my $cigar  = $alignment->cigar_str;
+        my $sc = ( $cigar =~ m/S/ );
+        next unless ( ( $misassembly ) or ( $sc ) );
+
+        # where does the alignment start in the reference sequence
+        #my $seqid  = $alignment->seq_id;
+        my $start  = $alignment->start;
+        my $end    = $alignment->end;
+        #my $strand = $alignment->strand;
+        #my $paired = $alignment->get_tag_values('PAIRED');
+
+        # where does the alignment start in the query sequence
+        my $query_start = $alignment->query->start;     
+        my $query_end   = $alignment->query->end;
+
+        #my $ref_dna   = $alignment->dna;        # reference sequence bases
+        my $query_dna = $alignment->query->dna; # query sequence bases
+
+        if ( $misassembly )
+          {
+            for my $i ( $start .. $end-$span )
+              { $refspan[$i]++; }
+          }
+
+        # left softclip
+        if ( $cigar =~ m/^(\d+)S/ )
+          {
+            my $sclen = $1;
+            if ( $sclen > $kmer )
+              {
+                my $sc = substr( $query_dna, 0, $sclen );
+                my $k = substr( $sc, -$kmer, $kmer );
+                my @e = split( //, substr( $sc, 0, length($sc) - $kmer ) );
+                for my $i ( 0 .. $#e )
+                  { $leftsc{$start}->{$k}->[$#e-$i]->{$e[$i]}++; }
+                    #      refstart  kmer leftoffset   base  count
+                if ( $misassembly )
+                  {
+                    for my $i ( 1 .. $span )
+                      {
+                        if ( ( $i <= $sclen ) and ( $start > $i ) )
+                          { $scspan[$start-$i]++; }
+                      }
+                  } # if $misassembly
+              } # if long enough
+          } # left softclip
+
+        # right softclip
+        if ( $cigar =~ m/(\d+)S$/ )
+          {
+            my $sclen = $1;
+            if ( $sclen > $kmer )
+              {
+                my $sc = substr( $query_dna, -$sclen, $sclen );
+                my $k = substr( $sc, 0, $kmer );
+                my @e = split( //, substr( $sc, $kmer, length($sc) ) );
+                for my $i ( 0 .. $#e )
+                  { $rightsc{$end}->{$k}->[$i]->{$e[$i]}++; }
+                     #      refend  kmer offset   base  count
+                if ( $misassembly )
+                  {
+                    for my $i ( 1 .. $span )
+                      {
+                        if ( $i <= $sclen )
+                          { $scspan[$end-$i+1]++; }
+                      }
+                  } # if $misassembly
+              } # if long enough
+          } # right softclip
+      } # for $alignment
+
+    # left summary
+    for my $refpos ( sort {$a<=>$b} keys %leftsc )
+      {
+        for my $kmer ( sort keys %{$leftsc{$refpos}} )
+          {
+            my @scinfo = @{$leftsc{$refpos}->{$kmer}};
+            my ( $scseq, $firstdepth, $lastdepth ) = parsesc( 1, @scinfo );
+            if ( $scseq )
+              {
+                my $refflank = substr( $seq[$seqidx{$atarget}]->{seq}, $refpos-1, $flanklength );
+                # edge filter
+                if ( ( ! $edge ) or ( ( $refpos > $edge ) and ( $refpos < ($targetlength-$edge) ) ) )
+                  { push( @outlines, [ $atarget, $refpos, '-', $firstdepth, $lastdepth, $scseq . ' ' . $kmer, $refflank, '' ] ); }
+              }
+          } # for $kmer
+      } # for $refpos
+
+    # right summary
+    for my $refpos ( sort {$a<=>$b} keys %rightsc )
+      {
+        for my $kmer ( sort keys %{$rightsc{$refpos}} )
+          {
+            my @scinfo = @{$rightsc{$refpos}->{$kmer}};
+            my ( $scseq, $firstdepth, $lastdepth ) = parsesc( 0, @scinfo );
+            if ( $scseq )
+              {
+                my $refflank = substr( $seq[$seqidx{$atarget}]->{seq}, $refpos-$flanklength, $flanklength );
+                push( @outlines, [ $atarget, $refpos, '+', $firstdepth, $lastdepth, '', $refflank, $kmer . ' ' . $scseq ] );
+              }
+          } # for $kmer
+      } # for $refpos
+
+    # misassembly
+    if ( $misassembly )
+      {
+        my @breakpoints;
+        for my $i ( 1 .. $targetlength - $span )
+          {
+            my $fractionbad = 1;
+            if ( $refspan[$i] )  # avoid divide by zero
+              {
+                my $sc = $scspan[$i] // 0;
+                my $r = $refspan[$i] // 0;
+                $fractionbad = $sc / ( $sc + $r );
+                if ( $fractionbad > $misassembly )
+                  {
+                    push( @outlines, [ $atarget, $i, 'misassy', $sc, $r ] );
+                    push( @breakpoints, $i );
+                  }
+              } # if $refspan
+          } # for $i
+
+        # divide sequences at misassembly points and save to fasta file
+        if ( $break )
+          {
+            my @outfasta;
+            if ( @breakpoints )
+              {
+                push( @breakpoints, $targetlength-1 );
+                my $prev = 0;
+                for my $i ( 0 .. $#breakpoints )
+                  {
+                    my $length = $breakpoints[$i] - $prev;
+                    if ( $length >= $minbreaklen )
+                      { push( @outfasta, [ $prev+1, $breakpoints[$i], substr( $seq[$seqidx{$atarget}]->{seq}, $prev, $length ) ] ); }
+                    $prev = $breakpoints[$i];
+                  }
+              } # if @breakpoints
+            else
+              { push( @outfasta, [ 1, $targetlength, $seq[$seqidx{$atarget}]->{seq} ] ); }
+            for my $i ( 0..$#outfasta )
+              {
+                print $BRKF '>', $seq[$seqidx{$atarget}]->{hdr}, '.', ($i+1), 
+                            ' ', $outfasta[$i]->[0], '..', $outfasta[$i]->[1], "\n";
+                print $BRKF $outfasta[$i]->[2], "\n";
+              }
+          } # if $break
+
+      } # if $misassembly
+
+    # print in coordinate sorted order
+    for my $lineref ( sort {$a->[1]<=>$b->[1]} @outlines )
+      { print $OUTF join( "\t", @$lineref ), "\n"; }
+
+    unless ( $quiet ) { print '  ', commify($nalignments), " alignments\n"; }
+  } # for $atarget
+unless ( $quiet ) { print commify($totalalignments)." total alignments were processed\n"; }
+
+
+
+if ( $break ) { stdclose( $BRKF ); }
+stdclose ( $OUTF );
+
+
+
+############################################################
+# cleanup and end program
+############################################################
+if ( $tempsymlink ) { unlink( $tempsymlink ); }
+unless ( $quiet ) { print "$0 Done\n"; }
+exit 0;
+
+
+
+############################################################
+sub picardindex { my ( $bam ) = @_;
+############################################################
+# Bio::DB::Sam does not recognize bam index files generated with Picard,
+# of the format xxxx.bai, it only recognizes samtools format xxxx.bam.bai
+# To avoid the -autoindex=>1 flag generating a duplicate index, check for
+# this situation, and make a symlink. The symlink name is returned,
+# but only if one was created, so that it can be removed later
+  if ( $bam =~ m/bam$/ )
+    {
+      my $samindex = $bam . '.bai';
+      ( my $picardindex = $bam ) =~ s/bam$/bai/;
+      if ( ( ! -e $samindex ) and ( -s $picardindex ) )
+        {
+          unless ( $quiet )
+            { print "Creating symlink to picard bam index file\n"; }
+          ( my $picardindexnopath = $picardindex ) =~ s|^.*/||;
+          unless ( symlink( $picardindexnopath, $samindex ) )
+            { die "Error creating symlink \"$samindex\" pointing to \"$picardindex\": $!\n"; }
+          return( $samindex );
+        }
+    }
+} # sub picardindex
+
+
+
+############################################################
+sub parsesc { my ( $reverse, @scinfo ) = @_;
+############################################################
+  # parse a softclip array of hashes, and return the softclip,
+  # or return a null string if it fails depth filters
+  my $result = '';
+  my $firstdepth = 0;
+  my $lastdepth = 0;
+  my @depths;
+  for my $i ( 0 .. $#scinfo )
+    {
+      # sort high to low based on coverage
+      my @sortednt = sort( {$scinfo[$i]->{$b}<=>$scinfo[$i]->{$a}} keys %{$scinfo[$i]} );
+      # starting depth filter
+      if ( $i == 0 )
+        {
+          $firstdepth = $scinfo[$i]->{$sortednt[0]};
+          if ( $firstdepth < $startdepth )
+            { last; }
+        }
+      # ending depth filter
+      if ( $scinfo[$i]->{$sortednt[0]} < $enddepth )
+        { last; }
+      # alternate base filter, failure indicated by 'N' at end
+      if ( $sortednt[1] )
+        {
+          my $altfrac = $scinfo[$i]->{$sortednt[1]} / $scinfo[$i]->{$sortednt[0]};
+          if ( $altfrac > $maxaltdepth )
+            {
+              $result .= 'N';
+              last;
+            }
+        }
+      $lastdepth = $scinfo[$i]->{$sortednt[0]};
+      $result .= $sortednt[0];
+    } # for $i
+  if ( $reverse ) { $result = reverse( $result ); }
+  return( $result, $firstdepth, $lastdepth );
+} # sub parsesc
+
+
+
+############################################################
+sub debugmsg { my ( $text, $noreturn, $nolinenum ) = @_;
+############################################################
+  if ( $debug )
+    {
+      my ($package, $filename, $line, $sub) = caller(0);
+      unless ( $nolinenum ) { $text = "Line $line: " . $text; }
+      if ( ! ( $noreturn ) ) { $text .= "\n"; }
+      print $text;
+    } # if ( $debug )
+} # sub debugmsg
+
+
+
+###############################################################
+sub timestr {
+###############################################################
+  @_ = localtime(shift || time);
+  return(sprintf("%04d/%02d/%02d %02d:%02d", $_[5]+1900, $_[4]+1, $_[3], @_[2,1]));
+} # sub timestr
+
+
+
+###############################################################
+sub commify {
+###############################################################
+# http://perldoc.perl.org/perlfaq5.html#How-can-I-output-my-numbers-with-commas
+  local $_ = shift;
+  1 while s/^([-+]?\d+)(\d{3})/$1,$2/;
+  return $_;
+} # commify
+
+
+
+###############################################################
+sub stdopen { my ( $mode, $filename, $extratext ) = @_;
+###############################################################
+# a replacement for the three-parameter open which also allows
+# the use of "-" as the file name to mean STDIN or STDOUT
+  my $fh;  # the file handle
+  if ( $filename eq "-" )  # only exact match to "-" has special meaning
+    {
+      if ( $mode =~ m/>/ )
+        { $fh = *STDOUT }
+      else
+        { $fh = *STDIN }
+    }
+  else
+    {
+      # supplemental passed text for error messages, need one more space
+      if ( defined $extratext )
+        { $extratext .= " " }
+      else
+        { $extratext = "" }
+
+      my $text;  # this is only used for error message
+      if ( $mode =~ m/^\+?>>/ )  # ">>" or "+>>"
+        { $text = "append" }
+      elsif ( $mode =~ m/^\+?>/ )  # ">" or "+>"
+        { $text = "output" }
+      elsif ( $mode =~ m/^\+?</ )  # "<" or "+<"
+        { $text = "input" }
+      elsif ( $mode eq "-|" )
+        { $text = "piped input" }
+      elsif ( $mode eq "|-" )
+        { $text = "piped output" }
+      else
+        { die "Error, unsupported file mode \"$mode\" specified to stdopen( $mode, $filename, $extratext )\n"; }
+
+      # if file name ends in ".gz", gzip compression is assumed, and handle it transparently
+      if ( $filename =~ m/\.gz$/ )
+        {
+          if ( $mode =~ m/^>$/ ) # output mode
+            { $mode = "|-"; $filename = "gzip -c > \"$filename\""; }
+          elsif ( $mode =~ m/^<$/ ) # input mode
+            { $mode = "-|"; $filename = "gunzip -c \"$filename\""; }
+          else
+            { die "Error, can't handle gzip compression with mode \"$mode\" for file \"filename\"\n"; }
+        } # if gzip compressed file
+      elsif ( $filename	=~ m/\.bz2$/ )
+       	{
+          if ( $mode =~ m/^>$/ ) # output mode
+            { $mode = "|-"; $filename = "bzip2 -c > \"$filename\""; }
+          elsif ( $mode =~ m/^<$/ ) # input mode
+            { $mode = "-|"; $filename = "bunzip2 -c \"$filename\""; }
+          else
+            { die "Error, can't handle bzip2 compression with mode \"$mode\" for file \"filename\"\n"; }
+       	}
+      open ( $fh, $mode, $filename ) or die ( "Error opening ${extratext}file \"$filename\" for $text: $!\n" );
+    }
+  # return the opened file handle to the caller
+  return $fh;
+} # sub stdopen
+
+
+
+###############################################################
+sub stdclose { my ( $fh ) = @_;
+###############################################################
+# same as built-in close, except in case of STDIN or STDOUT,
+# and in this case the file handle is not closed
+
+  unless ( fileno($fh) <= 2 )  # if file number is this low, is stdin or stdout or stderr
+    { close ( $fh ) or die ( "Error closing file handle: $!\n" ); }
+
+} # sub stdclose
+
+
+
+###############################################################
+sub loadfasta { my ( $infilename, $stripreturns ) = @_;
+###############################################################
+# load a single FASTA file into an array of hashes to separate header and sequence portion
+# e.g. $seq[3]->{hdr} contains the header of the fourth sequence, $seq[3]->{seq} contains the sequence
+# and the ">" is stripped off of the header
+  my @seq;
+  my $count = 0;  # number of sequences loaded
+  my $INF = stdopen( '<', $infilename );
+  while ( my $aline = <$INF> )
+    {
+      if ( $aline =~ m/^>(.*)$/ )
+        {
+          $aline =~ s/[\r\n]//g;
+          $aline =~ s/^>//;
+          $count++;
+          $seq[$count-1]->{hdr} = $aline;
+        }
+      else
+        {
+          if ( $stripreturns ) { $aline =~ s/[\r\n]//g; }
+          $seq[$count-1]->{seq} .= $aline;
+        }
+    } # while ( my $aline = <$INF> )
+  stdclose( $INF );
+  return @seq;
+} # sub loadfasta
+
+
+
+###############################################################
+sub indexfasta { my ( $seqref, $stripheaders ) = @_;
+###############################################################
+# if $stripheaders is true, remove anything in header after
+# the first white space. Returns a hash reference, key is
+# header, value is array index
+  my %index;
+  for my $i ( 0..$#{$seqref} )
+    {
+      my $hdr = $seqref->[$i]->{'hdr'};
+      if ( $stripheaders ) { $hdr =~ s/\s.*$//; }
+      if ( defined $index{$hdr} ) { die "Error, duplicate header \"$hdr\" while indexing\n"; }
+      $index{$hdr} = $i;
+    }
+  return \%index
+} # sub indexfasta
+
+
+
+# eof
