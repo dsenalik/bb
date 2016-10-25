@@ -4,6 +4,8 @@
 #----------------------------------------------------------#
 # "Black Box" program series
 # version 1.0 - September 2, 2016
+# version 1.1 - September 8, 2016 - add --nmask and --depth
+my $version = '1.1';
 =bb
 Analysis of softclipped reads in a sam or bam file
 =cut bb
@@ -21,10 +23,12 @@ my $defaultkmer = 10;
 my $defaultstartdepth = 10;
 my $defaultenddepth = 3;
 my $defaultmaxaltdepth = 0.5;
+my $defaultnmask = 1;
 my $defaultflanklength = 100;
 my $defaultspan = 1;
 my $progress = 1_000_000;  # progress update interval
 my $defaultminbreaklen = 1;
+my $kdelim = '';  # could be made into parameter to be a space to show where kmer ends
 
 
 
@@ -47,9 +51,11 @@ my $kmer         = $defaultkmer;  # kmer size for softclip grouping
 my $startdepth   = $defaultstartdepth;  # softclip read depth filter
 my $enddepth     = $defaultenddepth;  # softclip read depth filter
 my $edge;
+my $depth;
 my $maxaltdepth  = $defaultmaxaltdepth;
 my $misassembly;
 my $minbreaklen  = $defaultminbreaklen;
+my $nmask;
 my $span         = $defaultspan;
 my $flanklength  = $defaultflanklength;
 my $noheader;
@@ -62,12 +68,14 @@ GetOptions (
             "outfile=s"      => \$outfilename,       # string
             "break=s"        => \$break,             # string
             "minbreak=i"     => \$minbreaklen,       # integer
+            "depth"          => \$depth,             # flag
             "enddepth=i"     => \$enddepth,          # integer
             "edge=i"         => \$edge,              # integer
             "flanklength=i"  => \$flanklength,       # integer
             "kmer=i"         => \$kmer,              # integer
             "maxaltdepth=s"  => \$maxaltdepth,       # string (real)
             "misassembly=s"  => \$misassembly,       # string (real)
+            "nmask:i"        => \$nmask,             # flag|integer
             "span=i"         => \$span,              # integer
             "startdepth=i"   => \$startdepth,        # integer
             "noheader"       => \$noheader,          # flag
@@ -75,6 +83,8 @@ GetOptions (
             "quiet"          => \$quiet,             # flag
             "debug"          => \$debug);            # flag
 unless ( ( $bam ) and ( $reference ) and ( $outfilename ) ) { $help = 1 }
+if ( ( defined $nmask ) and ( $nmask eq '0' ) ) { $nmask = $defaultnmask; }
+$nmask //= 0;
 # debug implies not quiet
 if ( $debug ) { $quiet = 0; }
 if ( ( $outfilename ) and ( $outfilename eq "-" ) ) { $quiet = 1 }
@@ -86,7 +96,7 @@ if ( ( $outfilename ) and ( $outfilename eq "-" ) ) { $quiet = 1 }
 ############################################################
 if ( $help )
   {
-    print "$prognopath
+    print "$prognopath version $version
 This program will analyze softclipped reads in a bam file.
 Softclipped reads, if appearing consistently in all or a significant
 fraction of the reads, can be caused by sequence difference between
@@ -107,17 +117,23 @@ Optional parameters:
                     default=$defaultenddepth
   --edge=xxx        integer, ignore softclips within this distance of either
                     end of the reference sequence, default is no filtering
+  --nmask[=xxx]     flag with optional integer, ignore softclips where
+                    the reference contains >= this number of N characters
+                    within the first --kmer bases. The default value if
+                    not specified is $defaultnmask
   --maxaltdepth=xxx real, maximum fraction of read depth that an alternate
                     base can reach before terminating softclip with 'N'
                     indicator, default=$defaultmaxaltdepth
   --flanklength=xxx length of flanking reference sequence to include in
                     results, default=$defaultflanklength
   --noheader        omit the header line from the output file
+  --depth           flag, turns on read depth statistics,
+                    this option increases run time
   --misassembly=xxx real, turns on misassembly detection, the value is
                     fraction of reads softclipped across --span distance,
                     this option increases run time
   --span=xxx        integer, span used for misassembly detection,
-                    default=$defaultspan                    
+                    default=$defaultspan
   --break=xxx       optional output fasta file with sequences divided at
                     each misassembly point (requires --misassembly)
   --minbreak=xxx    integer, sequences shorter than this will not be saved
@@ -151,14 +167,23 @@ my $OUTF = stdopen ( ">", $outfilename );
 my $BRKF;
 if ( $break ) { $BRKF = stdopen ( ">", $break ); }
 unless ( $noheader )
-  { print $OUTF join( "\t", "Target", "Position", "Direction", "Starting_Depth", "Ending_Depth",
-                            "Left_Softclip", "Reference", "Right_Softclip" ), "\n"; }
+  {
+     my @outcols = ( "Target", "Position", "Direction", "Starting_Depth", "Ending_Depth",
+                    "Left_Softclip", "Reference", "Right_Softclip" );
+     if ( $depth ) { splice( @outcols, 3, 0, 'Reference_Depth' ); }
+     print $OUTF join( "\t", @outcols ), "\n";
+  }
 
 my $totalalignments = 0;
 for my $atarget ( @targets )
   {
     unless ( $quiet ) { print "Analyzing target \"$atarget\"\n"; }
     my @alignments = $sam->get_features_by_location( -seq_id => $atarget );
+    unless ( $seqidx{$atarget} )
+      {
+        print "Warning, no mapped reads for sequence \"$atarget\", skipping\n";
+        next;
+      }
     my $targetlength = length( $seq[$seqidx{$atarget}]->{seq} );
     $totalalignments += scalar( @alignments );
     my %leftsc;
@@ -167,6 +192,7 @@ for my $atarget ( @targets )
     my @scspan;   # for --misassembly detection, "soft clip" coverage
     my @outlines;
     my $nalignments = 0;
+    my $nnmasked = 0;
     for my $alignment ( @alignments )
       {
         $nalignments++;
@@ -179,7 +205,7 @@ for my $atarget ( @targets )
         # first filter is to require a softclip
         my $cigar  = $alignment->cigar_str;
         my $sc = ( $cigar =~ m/S/ );
-        next unless ( ( $misassembly ) or ( $sc ) );
+        next unless ( ( $misassembly ) or ( $depth ) or ( $sc ) );
 
         # where does the alignment start in the reference sequence
         #my $seqid  = $alignment->seq_id;
@@ -195,9 +221,9 @@ for my $atarget ( @targets )
         #my $ref_dna   = $alignment->dna;        # reference sequence bases
         my $query_dna = $alignment->query->dna; # query sequence bases
 
-        if ( $misassembly )
+        if ( ( $misassembly ) or ( $depth ) )
           {
-            for my $i ( $start .. $end-$span )
+            for my $i ( $start .. $end ) #-$span )
               { $refspan[$i]++; }
           }
 
@@ -209,18 +235,26 @@ for my $atarget ( @targets )
               {
                 my $sc = substr( $query_dna, 0, $sclen );
                 my $k = substr( $sc, -$kmer, $kmer );
-                my @e = split( //, substr( $sc, 0, length($sc) - $kmer ) );
-                for my $i ( 0 .. $#e )
-                  { $leftsc{$start}->{$k}->[$#e-$i]->{$e[$i]}++; }
-                    #      refstart  kmer leftoffset   base  count
-                if ( $misassembly )
+                my $refk = '';  # reference at position of kmer
+                if ( $nmask ) { $refk = substr( $seq[$seqidx{$atarget}]->{seq}, $start-1-$kmer, $kmer ); }
+                my $ncount = $refk =~ tr/Nn//;
+                if ( ( ! $nmask ) or ( $ncount < $nmask ) )
                   {
-                    for my $i ( 1 .. $span )
+                    my @e = split( //, substr( $sc, 0, length($sc) - $kmer ) );
+                    for my $i ( 0 .. $#e )
+                      { $leftsc{$start}->{$k}->[$#e-$i]->{$e[$i]}++; }
+                        #      refstart  kmer leftoffset   base  count
+                    if ( $misassembly )
                       {
-                        if ( ( $i <= $sclen ) and ( $start > $i ) )
-                          { $scspan[$start-$i]++; }
-                      }
-                  } # if $misassembly
+                        for my $i ( 1 .. $span )
+                          {
+                            if ( ( $i <= $sclen ) and ( $start > $i ) )
+                              { $scspan[$start-$i]++; }
+                          }
+                      } # if $misassembly
+                  } # if not mask too many N
+                else
+                  { $nnmasked++; }
               } # if long enough
           } # left softclip
 
@@ -232,18 +266,26 @@ for my $atarget ( @targets )
               {
                 my $sc = substr( $query_dna, -$sclen, $sclen );
                 my $k = substr( $sc, 0, $kmer );
-                my @e = split( //, substr( $sc, $kmer, length($sc) ) );
-                for my $i ( 0 .. $#e )
-                  { $rightsc{$end}->{$k}->[$i]->{$e[$i]}++; }
-                     #      refend  kmer offset   base  count
-                if ( $misassembly )
+                my $refk = '';  # reference at position of kmer
+                if ( $nmask ) { $refk = substr( $seq[$seqidx{$atarget}]->{seq}, $end, $kmer ); }
+                my $ncount = $refk =~ tr/Nn//;
+                if ( ( ! $nmask ) or ( $ncount < $nmask ) )
                   {
-                    for my $i ( 1 .. $span )
+                    my @e = split( //, substr( $sc, $kmer, length($sc) ) );
+                    for my $i ( 0 .. $#e )
+                      { $rightsc{$end}->{$k}->[$i]->{$e[$i]}++; }
+                         #      refend  kmer offset   base  count
+                    if ( $misassembly )
                       {
-                        if ( $i <= $sclen )
-                          { $scspan[$end-$i+1]++; }
-                      }
-                  } # if $misassembly
+                        for my $i ( 1 .. $span )
+                          {
+                            if ( $i <= $sclen )
+                              { $scspan[$end-$i+1]++; }
+                          }
+                      } # if $misassembly
+                  } # if not mask too many N
+                else
+                  { $nnmasked++; }
               } # if long enough
           } # right softclip
       } # for $alignment
@@ -260,7 +302,11 @@ for my $atarget ( @targets )
                 my $refflank = substr( $seq[$seqidx{$atarget}]->{seq}, $refpos-1, $flanklength );
                 # edge filter
                 if ( ( ! $edge ) or ( ( $refpos > $edge ) and ( $refpos < ($targetlength-$edge) ) ) )
-                  { push( @outlines, [ $atarget, $refpos, '-', $firstdepth, $lastdepth, $scseq . ' ' . $kmer, $refflank, '' ] ); }
+                  {
+                    my @outcols = ( $atarget, $refpos, '-', $firstdepth, $lastdepth, $scseq . $kdelim . $kmer, $refflank, '' );
+                    if ( $depth ) { splice( @outcols, 3, 0, $refspan[$refpos] // 0 ); }
+                    push( @outlines, \@outcols );
+                  }
               }
           } # for $kmer
       } # for $refpos
@@ -275,7 +321,13 @@ for my $atarget ( @targets )
             if ( $scseq )
               {
                 my $refflank = substr( $seq[$seqidx{$atarget}]->{seq}, $refpos-$flanklength, $flanklength );
-                push( @outlines, [ $atarget, $refpos, '+', $firstdepth, $lastdepth, '', $refflank, $kmer . ' ' . $scseq ] );
+                # edge filter
+                if ( ( ! $edge ) or ( ( $refpos > $edge ) and ( $refpos < ($targetlength-$edge) ) ) )
+                  {
+                    my @outcols = ( $atarget, $refpos, '+', $firstdepth, $lastdepth, '', $refflank, $kmer . $kdelim . $scseq );
+                    if ( $depth ) { splice( @outcols, 3, 0, $refspan[$refpos] // 0 ); }
+                    push( @outlines, \@outcols );
+                  }
               }
           } # for $kmer
       } # for $refpos
@@ -294,7 +346,9 @@ for my $atarget ( @targets )
                 $fractionbad = $sc / ( $sc + $r );
                 if ( $fractionbad > $misassembly )
                   {
-                    push( @outlines, [ $atarget, $i, 'misassy', $sc, $r ] );
+                    my @outcols = ( $atarget, $i, 'misassy', 'sc='.$sc, 'ref='.$r );
+                    if ( $depth ) { splice( @outcols, 3, 0, '' ); }
+                    push( @outlines, \@outcols );
                     push( @breakpoints, $i );
                   }
               } # if $refspan
@@ -332,7 +386,12 @@ for my $atarget ( @targets )
     for my $lineref ( sort {$a->[1]<=>$b->[1]} @outlines )
       { print $OUTF join( "\t", @$lineref ), "\n"; }
 
-    unless ( $quiet ) { print '  ', commify($nalignments), " alignments\n"; }
+    unless ( $quiet )
+      {
+        print '  ', commify($nalignments), ' alignments';
+        if ( $nnmasked ) { print ', ', commify($nnmasked), " sofclips over >=$nmask N's masked"; }
+        print "\n";
+      }
   } # for $atarget
 unless ( $quiet ) { print commify($totalalignments)." total alignments were processed\n"; }
 
