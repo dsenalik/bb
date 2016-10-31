@@ -5,7 +5,8 @@
 # "Black Box" program series
 # version 1.0 - September 2, 2016
 # version 1.1 - September 8, 2016 - add --nmask and --depth
-my $version = '1.1';
+# version 1.2 - October 30, 2016 - fix bug line 182
+my $version = '1.2';
 =bb
 Analysis of softclipped reads in a sam or bam file
 =cut bb
@@ -179,7 +180,7 @@ for my $atarget ( @targets )
   {
     unless ( $quiet ) { print "Analyzing target \"$atarget\"\n"; }
     my @alignments = $sam->get_features_by_location( -seq_id => $atarget );
-    unless ( $seqidx{$atarget} )
+    unless ( defined $seqidx{$atarget} )
       {
         print "Warning, no mapped reads for sequence \"$atarget\", skipping\n";
         next;
