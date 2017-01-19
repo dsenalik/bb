@@ -17,7 +17,8 @@ use Getopt::Long;      # for getting command line parameters
 # Version 1.3 April 5, 2016     - Add --gff and --keyforgff, now supports .gz compression
 # Version 1.4 June 15, 2016     - Update to --lifttable to support --oneseq
 # Version 1.5 July 13, 2016     - add --removezeroes, this is no longer default behavior
-my $version = "1.5";
+# Version 1.6 July 13, 2016     - allow sequence name of "0"
+my $version = "1.6";
 
 
 
@@ -259,7 +260,7 @@ foreach my $infilename ( @infilenames )
           }
         else
           {
-            unless ( $currkey ) { die "Error, no current key, maybe this is not a fasta file. line $nlines=\"$aline\"\n"; }
+            unless ( defined $currkey ) { die "Error, no current key, maybe this is not a fasta file. line $nlines=\"$aline\"\n"; }
             $inseq{$currkey} .= $aline;  # retains newlines
           }
       } # while <$INF>

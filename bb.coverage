@@ -12,6 +12,12 @@ use Getopt::Long;      # for getting command line parameters
 use Sys::CPU;          # for default number of cpu cores to use
 use File::Temp  qw/ tempfile /;
 # version 1.0  July 14, 2016
+# version 1.1  Jan 19, 2017 - update because of changes to coverageBed parameters as of
+#                             v2.24.0 (27-May-2015) i.e. "We have changed the behavior
+#                             of the coverage tool such that it is consistent with the
+#                             other tools. Specifically, coverage is now computed for
+#                             the intervals in the A file based on the overlaps with
+#                             the B file, rather than vice versa."
 
 
 
@@ -661,7 +667,9 @@ if ( @bamnames )
                 if ( ! -s $thisbed )
                   {
                     unless ( $quiet ) { print "Creating BED file \"$thisbed\" from \"$bam\" + \"$refbed\"\n"; }
-                    my $cmd = "coverageBed -abam \"$bam\" -b \"$refbed\" -d > \"$thisbed\"";
+                    # changed Jan. 19, 2017 for change in bedtools coverageBed, see version notes
+                    # at top of this program. used to be --abam xxx -b xxx here
+                    my $cmd = "coverageBed -b \"$bam\" -a \"$refbed\" -d -split -sorted > \"$thisbed\"";
                     unless ( $quiet ) { print "COMMAND: $cmd\n"; }
                     my $result = system ( $cmd );
                     if ( $result ) { die "Error $result running command \"$cmd\"\n"; }

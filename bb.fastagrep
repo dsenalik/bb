@@ -3,6 +3,8 @@
 #        Author: Douglas Senalik dsenalik@wisc.edu         #
 #----------------------------------------------------------#
 # "Black Box" program series
+# version 1.0 - September 12, 2014
+# version 1.1 - October 24, 2016 - --trim performed before grep searching
 =bb
 Search and return sequences from FASTA or FASTQ files based on matches
 to one or more queries to text in the header line. Also can do search
@@ -120,7 +122,8 @@ Optional parameters:
                     space off of the grep expression
   --returncount     program error code will be number of
                     sequences returned, otherwise it is 0 for success
-  --trim            trim all FASTA/Q header after the first white space
+  --trim            trim all FASTA/Q headers after the first white space
+                    prior to grep
   --v               invert the search, only return non-hits (like grep -v)
   --append          append results to existing --outfile
   --raw             do not return headers, only sequence is output
@@ -241,6 +244,8 @@ unless ( $fastq )
         if ( $aline =~ m/^>(.*)$/ )
           {
             $header = $1;
+            if ( $trim )
+              { $header =~ s/\s.*$//; }
 
             # print prior sequence
             fastaout ( $fhoutfile, $seqbuffer );
@@ -258,8 +263,6 @@ unless ( $fastq )
                     last;
                   } # if grep matches
               } # foreach @grep
-            if ( $trim )
-              { $aline =~ s/\s.*$//; }
             if ( $invert ) { $keep = ! $keep; }
             if ( $keep )
               {
@@ -297,6 +300,8 @@ else  # $fastq
             unless ( $aline =~ m/^\@(.*)$/ )
               { die "Error, invalid format for line \"$aline\", does not start with \"@\"\n"; }
             my $header = $1;
+            if ( $trim )
+              { $header =~ s/\s.*$//; }
             $keep = 0;
             $totalseq++;
             for my $i ( 0..$#grep )
@@ -311,8 +316,6 @@ else  # $fastq
                     last;
                   } # if grep matches
               } # foreach @grep
-            if ( $trim )
-              { $aline =~ s/\s.*$//; }
           } # if header line
         if ( $invert ) { $keep = ! $keep; }
         if ( ( $keep ) and ! ( $raw and ( $subline != 1 ) ) )
