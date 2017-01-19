@@ -17,7 +17,7 @@ use File::Temp  qw/ tempfile /;
 #                             of the coverage tool such that it is consistent with the
 #                             other tools. Specifically, coverage is now computed for
 #                             the intervals in the A file based on the overlaps with
-#                             the B file, rather than vice versa."
+#                             the B file, rather than vice versa"
 
 
 
