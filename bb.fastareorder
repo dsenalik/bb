@@ -19,6 +19,7 @@ use Getopt::Long;      # for getting command line parameters
 # Version 1.5 July 13, 2016     - add --removezeroes, this is no longer default behavior
 # Version 1.6 July 13, 2016     - allow sequence name of "0"
 # Version 1.7 August 13, 2017   - correction so --removezeroes is truly not default behavior
+# Version 1.8 August 14, 2017   - reverse complement bugfix, and suffix changed from ' RC' to 'rc'
 my $version = "1.7";
 
 
@@ -397,7 +398,7 @@ for my $i ( 0 .. $#seq )
 
     # strip off reverse complement flag if present
     my $rc = 0;
-    if ( $aseqnum =~ m/\-$/ ) { $rc = 1; }
+    if ( ( $aseqnum =~ m/^\-/ ) or ( $aseqnum =~ m/\-$/ ) ) { $rc = 1; }
     $aseqnum =~ s/[\-\+]$//g;
     $aseqnum =~ s/^[\-\+]//g;
 
@@ -539,9 +540,9 @@ for my $i ( 0 .. $#seq )
               }
             if ( $startstop )
               { $thishdr .= " " . ($currbp+1) . ".." . ($currbp+$seqlen); }
-            # append " RC" to end of FASTA header if we reverse complemented it
+            # append "rc" to end of FASTA header if we reverse complemented it
             if ( $rc )
-              { $thishdr .= " RC"; }
+              { $thishdr .= "rc"; }
             $thishdr .= "\n";
             $outfdata .= $thishdr;
             $nlines++;
@@ -870,7 +871,7 @@ foreach my $aseq ( @unexpanded )
 
         # save reverse complement flag
         my $revcomp = $fwdflag;
-        if ( $asubseq =~ m/-$/ ) { $revcomp = "-"; }
+        if ( ( $asubseq =~ m/^\-/ ) or ( $asubseq =~ m/\-$/ ) ) { $revcomp = 1; }
 
         # remove "-" or "+"
         $asubseq =~ s/[\-\+]$//g;
@@ -890,7 +891,7 @@ foreach my $aseq ( @unexpanded )
             unless ( $prefix ) { $prefix = $globalprefix; }
             for ( my $i=$start; $i<=$end; $i++ )
               {
-                my $fullid = $revcomp.$prefix.$i.$subrange;
+                my $fullid = ($revcomp?'-':'').$prefix.$i.$subrange;
                 push ( @expanded, $fullid );
                 if ( $index <= 10 ) { debugmsg ( "  Saving expanded sequence \"$fullid\"" ); }
               }
@@ -915,7 +916,7 @@ foreach my $aseq ( @unexpanded )
             # trim leading zeroes
             if ( $removezeroes )
               { $number =~ s/^0+([1-9])/$1/; }
-            my $fullid = $revcomp.$prefix.$number.$subrange;
+            my $fullid = ($revcomp?'-':'').$prefix.$number.$subrange;
             debugmsg ( "Fullid = \"$fullid\"" );
             push ( @expanded, $fullid );
             if ( $index <= 10 ) { debugmsg ( "  Saving single contig \"$fullid\"" ); }
