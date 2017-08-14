@@ -18,7 +18,8 @@ use Getopt::Long;      # for getting command line parameters
 # Version 1.4 June 15, 2016     - Update to --lifttable to support --oneseq
 # Version 1.5 July 13, 2016     - add --removezeroes, this is no longer default behavior
 # Version 1.6 July 13, 2016     - allow sequence name of "0"
-my $version = "1.6";
+# Version 1.7 August 13, 2017   - correction so --removezeroes is truly not default behavior
+my $version = "1.7";
 
 
 
@@ -396,8 +397,9 @@ for my $i ( 0 .. $#seq )
 
     # strip off reverse complement flag if present
     my $rc = 0;
-    if ( $aseqnum =~ m/-/ ) { $rc = 1; }
-    $aseqnum =~ s/[\-\+]//g;
+    if ( $aseqnum =~ m/\-$/ ) { $rc = 1; }
+    $aseqnum =~ s/[\-\+]$//g;
+    $aseqnum =~ s/^[\-\+]//g;
 
     # check for special spacer
     unless ( $aseqnum =~ m/^S\d*$/i )
@@ -868,16 +870,22 @@ foreach my $aseq ( @unexpanded )
 
         # save reverse complement flag
         my $revcomp = $fwdflag;
-        if ( $asubseq =~ m/-/ ) { $revcomp = "-"; }
+        if ( $asubseq =~ m/-$/ ) { $revcomp = "-"; }
 
         # remove "-" or "+"
-        $asubseq =~ s/[\-\+]//g;
+        $asubseq =~ s/[\-\+]$//g;
+        $asubseq =~ s/^[\-\+]//g;
 
         # expand ranges
         if ( $asubseq =~ m/^(.*)(\d+)\.\.([^:]*)(\d+)/ )
           {
-            ( my $start = $2 ) =~ s/^0+//;
-            ( my $end = $4 ) =~ s/^0+//;
+            my $start = $2;
+            my $end = $4;
+            if ( $removezeroes )
+              {
+                $start =~ s/^0+//;
+                $end =~ s/^0+//;
+              }
             my $prefix = $1;
             unless ( $prefix ) { $prefix = $globalprefix; }
             for ( my $i=$start; $i<=$end; $i++ )
@@ -905,7 +913,8 @@ foreach my $aseq ( @unexpanded )
               { $prefix = $asubseq; }
             unless ( $prefix ) { $prefix = $globalprefix; }
             # trim leading zeroes
-            $number =~ s/^0+([1-9])/$1/;
+            if ( $removezeroes )
+              { $number =~ s/^0+([1-9])/$1/; }
             my $fullid = $revcomp.$prefix.$number.$subrange;
             debugmsg ( "Fullid = \"$fullid\"" );
             push ( @expanded, $fullid );
