@@ -3,51 +3,51 @@
 #        Author: Douglas Senalik dsenalik@wisc.edu         #
 #----------------------------------------------------------#
 # "Black Box" program series
+# version 1.0 - September 9, 2014
+# version 2.0 - November 4, 2017 - update from fb_shmiggle to topoview database files
+my $version = '2.0';
 =bb
 Data formatter and indexer for TopoView GBrowse track
 =cut bb
-# based on script from http://flybase.org/static_pages/docs/software/topoview.html
-# 2009-2010 Victor Strelets, FlyBase.org 
+# version 1.0 based on script from http://flybase.org/static_pages/docs/software/topoview.html
+#   2009-2010 Victor Strelets, FlyBase.org
+# version 2.0 based on coverage_to_topoview.pl program included with GBrowse
 use strict;
 use warnings;
 use Getopt::Long;      # for getting command line parameters
-use BerkeleyDB;        # installable with cpan
+use BerkeleyDB;        # installable with cpan, also first need sudo apt-get install libdb5.3-dev
 use File::Spec;        # path manipulation
+use File::Basename;    # replaces system call to basename in original code
 
 
 
 ############################################################
 # configuration variables
 ############################################################
-my %LogTabs= ( 0, 0, 1, 0 ); # for our purposes, these start values are right
+my %LogTabs= ( 0 => 0, 1 => 0 ); # a cache of previously calculated log values
 my $defaultfilesmask = '*.wig';
 my $defaultcrop = "250";
 my $do_only_subset;
 my $do_only_chr;
-my $defaultlognum = 100;
+my $defaultlognum = 10;
 my $datfilename = "data.cat";
 my $bdbfilename = "index.bdbhash";
-
-# leftovers from original program
-##$testing= 300000; # never used
-#$debug= 1; $do_only_chr= '2L';  
-#$debug= 1; $do_only_chr= '2L'; $do_only_subset= 'BS40_all_unique'; 
-#$debug= 1; $do_only_subset= 'Female_Heads'; $do_only_chr= '2';
 
 
 
 ############################################################
 # global variables
 ############################################################
-my $ansiup    = "\033[1A";  # terminal control
 (my $prognopath = $0) =~ s/^.*[\/\\]//;
 my $log2 = log(2);
 # %ResIndexHash in the original code was commented as global
 my %ResIndexHash;
+my %bdb_hash;  # the same as above but for version 2
 # but these others were just floating there (use strict was not used)
 my @SubsetNames;
 my $signal;
 my $max_signal;
+my $COV;  # file handle
 
 
 
@@ -61,6 +61,7 @@ my $apply_log;           # apply a log base 2 transformation
 my $log_magnifier= 1.0;  # scaling
 my $crop = $defaultcrop; # values larger than this are made equal to this
 my $lognum = -1;         # how many chromosomes to print to log -1=all, 0=none, >=1=this many
+my $shmiggle = 0;
 my $force = 0;           # make index if already exists
 my $help;                # print help and exit
 my $quiet;               # only show errors
@@ -73,13 +74,14 @@ GetOptions (
             "magnify|scale=s"=> \$log_magnifier,     # flag
             "crop=s"         => \$crop,              # string
             "part:i"         => \$lognum,            # flag or integer
+            "shmiggle"       => \$shmiggle,          # flag
             "force"          => \$force,             # flag
             "help"           => \$help,              # flag
             "quiet"          => \$quiet,             # flag
             "debug"          => \$debug);            # flag
 # debug implies not quiet
 if ( $debug ) { $quiet = 0; }
-if ( $lognum eq "" ) { $lognum = $defaultlognum; }
+if ( $lognum eq '' ) { $lognum = $defaultlognum; }
 unless ( $indir ) { $help = 1; }
 unless ( $outdir ) { $outdir = $indir; }
 
@@ -90,12 +92,13 @@ unless ( $outdir ) { $outdir = $indir; }
 ############################################################
 if ( $help )
   {
-    print "$prognopath
+    print "$prognopath version $version
 Required parameters:
   --indirectory=xxx directory containing files
 Optional parameters:
   --outdirectory=xxx location of generated index files. If not
-                    specified, will be --indirectory
+                    specified, will be --indirectory. This will
+                    be created if it does not exist
   --mask=xxx        wiggle file mask, default = \"$defaultfilesmask\"
                     another common option would be \"*.bed\" or \"*.bed.gz\"
   --log             apply log base 2 transformation
@@ -111,6 +114,8 @@ Optional parameters:
                     0=none, >=1=that many, default number=$defaultlognum
                     but if not specified, then all chromosomes are printed
   --force           overwrite existing database if it already exists
+  --shmiggle        use the old legacy code for the fb_shmiggle glyph
+                    instead of the current topoview glyph
   --help            print this screen
   --quiet           only print error messages
   --debug           print extra debugging information
@@ -127,14 +132,17 @@ unless ( -d $indir ) { die "Error, --indirectory \"$indir\" does not exist\n"; }
 if ( ( not $quiet ) and ( $apply_log ) )
   { print "Will apply log(2) transformation of data\n"; }
 unless ( $quiet ) { print "Indexing $filesmask files\n"; }
-indexfeatdir ( $indir, $outdir, $filesmask );
+if ( $shmiggle )  # legacy version, now obsolete
+  { shmiggleindexfeatdir ( $indir, $outdir, $filesmask ); }
+else  # current version based on GBrowse coverage_to_topoview.pl program
+  { indextopoview ( $indir, $outdir, $filesmask ); }
 
 
 
 ############################################################
 # cleanup and end program
 ############################################################
-unless ( $quiet ) { print "Done\n"; }
+unless ( $quiet ) { tlog( "$0 Done" ); }
 exit 0;
 
 
@@ -154,11 +162,19 @@ sub debugmsg { my ( $text, $noreturn, $nolinenum ) = @_;
 
 
 ###############################################################
-sub timestr {
+sub tlog { my ( $prefix, $suffix, $noreturn ) = @_;
 ###############################################################
-  @_ = localtime(shift || time);
-  return(sprintf("%04d/%02d/%02d %02d:%02d:%02d", $_[5]+1900, $_[4]+1, $_[3], @_[2,1,0]));
-} # sub timestr
+  $prefix //= '';
+  $suffix //= '';
+  @_ = localtime(time);
+  my $t = $prefix . '  '
+    . sprintf("%04d/%02d/%02d %02d:%02d:%02d", $_[5]+1900, $_[4]+1, $_[3], @_[2,1,0])
+    . '  ' . $suffix;
+  $t =~ s/^ +//;
+  $t =~ s/ +$//;
+  print $t;
+  unless ( $noreturn ) { print "\n"; }
+} # sub tlog
 
 
 
@@ -239,8 +255,115 @@ sub stdclose { my ( $fh ) = @_;
 
 
 
+###############################################################
+sub indextopoview { my ( $dir, $outdir, $mask ) = @_;
+###############################################################
+  my @files = sort( glob ( File::Spec->catfile( $dir, $mask ) ) );
+  debugmsg( scalar(@files)." files found to index: ".join("\t", @files) );
+  unless ( $quiet ) { print "Found ".commify(scalar @files)." files to process in directory \"$dir\" matching \"$mask\"\n"; }
+  unless ( @files ) { die "No files found in directory \"$dir\" with mask \"$mask\", terminating\n"; }
+  
+  if ( ! -d $outdir )
+    {
+      # coverage_to_topoview.pl used system mkdir -p $outdir, but
+      # here only allow one level of creation for "safety"
+      unless ( $quiet ) { print "Creating output directory \"$outdir\"\n"; }
+      mkdir( $outdir ) or die "Error creating output directory \"$outdir\": $!\n";
+    }
+
+  # database file names and check for already existing
+  my $localdatfilename = File::Spec->catfile( $outdir, $datfilename );
+  my $localbdbfilename = File::Spec->catfile( $outdir, $bdbfilename );
+  debugmsg ( "Database files: \"$localdatfilename\" and \"$localbdbfilename\"" );
+  if ( ( -e $localdatfilename ) or ( -e $localbdbfilename ) )
+    {
+      unless ( $force )
+        {
+          unless ( $quiet ) { print "Found existing index, no changes made\n"; }
+          return;
+        }
+      unless ( $quiet ) { print "Old index exists. Removing it and generating new index\n"; }
+      if ( -e $localdatfilename ) { unlink $localdatfilename or die "Error removing old file \"$localdatfilename\": $!\n"; }
+      if ( -e $localbdbfilename ) { unlink $localbdbfilename or die "Error removing old file \"$localbdbfilename\": $!\n"; }
+    }
+
+  open( $COV, '>', $localdatfilename ) or die "Cannot open \"$localdatfilename\": $!";
+
+  tie(%bdb_hash, "BerkeleyDB::Hash", -Filename => $localbdbfilename, -Flags => DB_CREATE);
+
+  $max_signal = 0; # global in the legacy version
+  @SubsetNames = (); # global in the legacy version
+
+  for my $file ( @files )
+    {
+      my $id = verifyfiletype( $file );  # will die if invalid
+      debugmsg( "Processing file \"$file\"" );
+      indexCoverageFile( $file, $id );
+    }
+
+  $bdb_hash{'subsets'} = join( "\t", @SubsetNames );
+  $bdb_hash{'max_signal'} = $max_signal;
+
+  my @all_keys = keys %bdb_hash;
+
+  if ( $debug )
+    { 
+      for my $kkey ( sort @all_keys )
+        { print "\"$kkey\" => \"" . $bdb_hash{$kkey} . "\"\n"; }
+    }
+
+  untie %bdb_hash;
+  chmod( 0666, $localbdbfilename );     # ! sometimes very important
+
+  close( $COV );
+
+} # sub indextopoview
+
+
+
+############################################################
+sub verifyfiletype { my ( $file ) = @_;
+############################################################
+# returns the track id if found
+  my $checknlines = 9;  # number of lines of file to check
+  my $INF = stdopen( '<', $file );
+  my $nlines = 0;
+  my $id;
+  while ( my $aline = <$INF> )
+    {
+      $nlines++;
+      last if ( $nlines > $checknlines );
+      $aline =~ s/[\r\n]//g;
+      if ( $aline =~ m/^track/ )  # e.g. track type=wiggle_0 name="somename"
+        {
+          if ( $aline =~ m/name=["']([^"]+)["']/i )
+            { $id = $1; }
+        }
+      else
+        {
+          my @cols = split( /\t/, $aline );
+          if ( scalar(@cols) != 4 )
+            { die "Invalid input file \"$file\": expected four columns, found ".scalar(@cols)." columns line $nlines\n"; }
+          for my $i ( 1, 2, 3 )
+            {
+              unless ( is_numeric($cols[$i]) )
+                { die "Invalid input file \"$file\": column ".($i+1)." \"$cols[$i]\" is not numeric line $nlines\n"; }
+            }
+        }
+    }
+  close( $INF );
+  return( $id );  # may be undefined
+} # sub verifyfiletype
+sub is_numeric {
+  no warnings;
+  return defined eval { $_[0] == 0 };
+} # sub is_numeric
+
+
+
+
 #*************************************************************************
-sub indexfeatdir { my ( $dir, $outdir, $mask ) = @_;
+sub shmiggleindexfeatdir { my ( $dir, $outdir, $mask ) = @_;
 #*************************************************************************
   my $ntoprint = $lognum;
   # original code ignored $mask, here it is replaced with a glob
@@ -276,8 +399,8 @@ sub indexfeatdir { my ( $dir, $outdir, $mask ) = @_;
   @SubsetNames= ();
   foreach my $file (sort @files)
     {
-      unless ( $quiet ) { print "Indexing file \"$file\" ".timestr()."\n"; }
-      indexCoverageFile($file); # coverage files are in fact wiggle files..
+      unless ( $quiet ) { tlog( "Indexing file \"$file\"" ); }
+      shmiggleIndexCoverageFile($file); # coverage files are in fact wiggle files..
     }
   $ResIndexHash{'subsets'}= join("\t",@SubsetNames); # record subsets, just in case..
   $ResIndexHash{'max_signal'}= $max_signal;
@@ -298,14 +421,127 @@ sub indexfeatdir { my ( $dir, $outdir, $mask ) = @_;
   close(OUTDATF);
 
   return;
-} # sub indexfeatdir
+} # sub shmiggleindexfeatdir
+
+
+
+#***********************************************************
+sub indexCoverageFile { my ( $file, $id ) = @_;
+#***********************************************************
+  my $ntoprint = $lognum;
+  my $INF = stdopen( '<', $file );
+
+  # identifier is based on file name without path or extension,
+  # unless a name is explicitly passed in as $id
+  my $SubsetName = $id?$id:basename( $file, '.wig.gz', '.wig.bz2', '.wig', '.bed.gz', '.bed.bz2', '.bed' );
+
+  unless ( $quiet )
+    { tlog( "Identifier=\"$SubsetName\" File=\"$file\""); }
+
+  push( @SubsetNames, $SubsetName );
+
+  my $old_ref = '';
+  my @offsets = ();
+
+  my $step = 1000;
+  my $coordstep = 5000;
+  my $counter = 0;
+  my $offset = tell($COV);
+
+  $bdb_hash{$SubsetName} = $offset;    # record offset where new subset data starts
+
+  my $old_signal = 0;
+  my $old_coord = -200000;
+  my $start = 0;
+  my $lastRecordedCoord = -200000;
+
+  my @signals;
+  while ( my $aline = <$INF> )
+    {
+      $offset = tell($COV);
+
+      $aline =~ s/[\r\n]//g;
+      next if ( ( $aline =~ m/^$/ ) or ( $aline =~ m/^\#/ ) or ( $aline =~ m/^track/ ) );
+      my ($ref,$start,$end,$signal) = split( /\t/, $aline );
+
+      $signal = modifySignal( $signal );
+
+      $start += 1; # zero-based, half-open coords in BED
+      $signal = 0 if $signal < 0;
+
+      # New chromosome
+      if ( $ref ne $old_ref )
+        {
+          if ( $ntoprint )
+            {
+              print "chromosome = \"$ref\"";
+              $ntoprint--;
+              unless ( $ntoprint ) { print " ... Remainder not shown"; }
+              print "\n";
+            }
+          dumpOffsets( $start, $SubsetName . ':' . $old_ref, @offsets )
+              unless $old_ref eq '';    # previous subset:arm
+          $old_ref = $ref;
+          print $COV "# subset=$SubsetName chromosome=$old_ref\n";
+          $offset = tell($COV);
+          $bdb_hash{ $SubsetName . ':' . $old_ref } =
+              $offset;    # record offset where new subset:arm data starts
+          @offsets = ("-200000\t$offset");
+          print $COV "-200000\t0\n";    # insert one fictive zero read
+          $offset = tell($COV);
+          print $COV "0\t0\n";    # insert one more fictive zero read
+          push( @offsets, "0\t$offset" );
+          $counter           = 0;
+          $old_signal        = 0;
+          $old_coord         = 0;
+          $lastRecordedCoord = 0;
+        } # if ( $ref ne $old_ref )
+
+
+      # fill in holes in coverage with 0
+      if ($start > $old_coord+1 && $old_signal > 0)
+        {
+          print $COV join("\t",++$old_coord,0), "\n";
+          $old_coord++;
+          $counter++;
+          $offset = tell($COV);
+          $old_signal = 0;
+        }
+
+      if ( $signal == $old_signal)
+        {
+          $old_coord = $end;
+          next;
+        }
+
+      $max_signal = $signal if $max_signal < $signal;
+      if ( $counter++ > $step
+             || $start - $lastRecordedCoord > $coordstep )
+        {
+          push( @offsets, "$start\t$offset" );
+          $counter           = 0;
+          $lastRecordedCoord = $start;
+        }
+
+      $old_coord  = $end;
+      $old_signal = $signal;
+
+      print $COV join("\t", $start, $signal), "\n";
+  }
+
+  # don't forget to dump offsets data on file end..
+  dumpOffsets( $start,$SubsetName . ':' . $old_ref, @offsets )
+    unless $old_ref eq '';    # previous subset:arm
+  stdclose($INF);
+  return;
+} # sub indexCoverageFile
 
 
 
 #*************************************************************************
-sub indexCoverageFile { my ( $file ) = @_;
+sub shmiggleIndexCoverageFile { my ( $file ) = @_;
 #*************************************************************************
-  # to reduce amount of output, only print first 100 $chromosome
+  # to reduce amount of output, only print first $lognum $chromosome
   my $ntoprint = $lognum;
   # modifies global $max_signal
   if( $debug && defined $do_only_subset )
@@ -375,7 +611,7 @@ sub indexCoverageFile { my ( $file ) = @_;
         {
         debugmsg ( "New chromosome \"$new_chromosome\" starting line $nlines" );
         $nchr++;
-        dumpOffsets($SubsetName.':'.$chromosome,@offsets) unless $chromosome eq ""; # previous subset:arm
+        shmiggleDumpOffsets($SubsetName.':'.$chromosome,@offsets) unless $chromosome eq ""; # previous subset:arm
         $chromosome= $new_chromosome;
         print OUTDATF "# subset=$SubsetName chromosome=$chromosome\n";
         $offset= tell(OUTDATF);
@@ -408,7 +644,7 @@ sub indexCoverageFile { my ( $file ) = @_;
         {
         debugmsg ( "New chromosome \"$new_chromosome\" starting line $nlines" );
         $nchr++;
-        dumpOffsets($SubsetName.':'.$chromosome,@offsets) unless $chromosome eq ""; # previous subset:arm
+        shmiggleDumpOffsets($SubsetName.':'.$chromosome,@offsets) unless $chromosome eq ""; # previous subset:arm
         $chromosome= $new_chromosome;
         print OUTDATF "# subset=$SubsetName chromosome=$chromosome\n";
         $offset= tell(OUTDATF);
@@ -450,7 +686,7 @@ sub indexCoverageFile { my ( $file ) = @_;
         {
         debugmsg ( "New chromosome \"$new_chromosome\" starting line $nlines" );
         $nchr++;
-        dumpOffsets($SubsetName.':'.$chromosome,@offsets) unless $chromosome eq ""; # previous subset:arm
+        shmiggleDumpOffsets($SubsetName.':'.$chromosome,@offsets) unless $chromosome eq ""; # previous subset:arm
         $chromosome= $new_chromosome;
         print OUTDATF "# subset=$SubsetName chromosome=$chromosome\n";
         $offset= tell(OUTDATF);
@@ -514,7 +750,7 @@ sub indexCoverageFile { my ( $file ) = @_;
         {
         debugmsg ( "New chromosome \"$new_chromosome\" starting line $nlines" );
         $nchr++;
-        dumpOffsets($SubsetName.':'.$chromosome,@offsets) unless $chromosome eq ""; # previous subset:arm
+        shmiggleDumpOffsets($SubsetName.':'.$chromosome,@offsets) unless $chromosome eq ""; # previous subset:arm
         $chromosome= $new_chromosome;
         print OUTDATF "# subset=$SubsetName chromosome=$chromosome\n";
         $offset= tell(OUTDATF);
@@ -565,7 +801,7 @@ sub indexCoverageFile { my ( $file ) = @_;
         {
         debugmsg ( "New chromosome \"$new_chromosome\" starting line $nlines" );
         $nchr++;
-        dumpOffsets($SubsetName.':'.$chromosome,@offsets) unless $chromosome eq ""; # previous subset:arm
+        shmiggleDumpOffsets($SubsetName.':'.$chromosome,@offsets) unless $chromosome eq ""; # previous subset:arm
         $chromosome= $new_chromosome;
         print OUTDATF "# subset=$SubsetName chromosome=$chromosome\n";
         $offset= tell(OUTDATF);
@@ -630,11 +866,11 @@ sub indexCoverageFile { my ( $file ) = @_;
     print OUTDATF $str;
     }
   # don't forget to dump offsets data on file end..
-  dumpOffsets($SubsetName.':'.$chromosome,@offsets) unless $chromosome eq ""; # previous subset:arm
+  shmiggleDumpOffsets($SubsetName.':'.$chromosome,@offsets) unless $chromosome eq ""; # previous subset:arm
   close(INF);
   unless ( $quiet ) { print "Processed ".commify($nlines)." lines, ".commify($nchr)." chromosomes in file \"$file\"\n"; }
   return;
-} # sub indexCoverageFile
+} # sub shmiggleIndexCoverageFile
 
 
 
@@ -665,8 +901,38 @@ sub modifySignal { my $signal = shift;
 
 
 
+#***********************************************************
+sub dumpOffsets { my ( $start, $key, @offsetlines ) = @_;
+#***********************************************************
+  print $COV "# offsets for $key\n";
+  my $offset     = tell($COV);
+  my $prevoffset = $offset;
+  $bdb_hash{ $key . ':offsets' } = $offset
+    ; # record offset where offsets VALUES for subset:arm data start (skip header)
+  my $oldbigstep = 0;
+  foreach my $str (@offsetlines)
+    {
+      print $COV $str . "\n";
+      my ( $start, $floffset ) = split( /[ \t]+/, $str );
+
+      # following wasn't working properly..
+      my $newbigstep = int( $start / 1000000.0 );
+      if ( $newbigstep > $oldbigstep )
+        {
+          $bdb_hash{ $key . ':offsets:' . $newbigstep } =
+            $prevoffset;    # one before is the right start
+          $oldbigstep = $newbigstep;
+        }
+      $prevoffset = $offset;
+      $offset     = tell($COV);
+    }
+  return;
+} # sub dumpOffsets
+
+
+
 #*************************************************************************
-sub dumpOffsets { my ( $key, @offsetlines ) = @_;
+sub shmiggleDumpOffsets { my ( $key, @offsetlines ) = @_;
 #*************************************************************************
   print OUTDATF "# offsets for $key\n";
   my $offset= tell(OUTDATF);
@@ -688,7 +954,7 @@ sub dumpOffsets { my ( $key, @offsetlines ) = @_;
     $offset= tell(OUTDATF);
     }
   return;
-} # sub dumpOffsets
+} # sub shmiggleDumpOffsets
 
 
 

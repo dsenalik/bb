@@ -20,7 +20,7 @@ use Getopt::Long;      # for getting command line parameters
 # Version 1.6 July 13, 2016     - allow sequence name of "0"
 # Version 1.7 August 13, 2017   - correction so --removezeroes is truly not default behavior
 # Version 1.8 August 14, 2017   - reverse complement bugfix, and suffix changed from ' RC' to 'rc'
-my $version = "1.7";
+my $version = "1.8";
 
 
 
@@ -871,7 +871,7 @@ foreach my $aseq ( @unexpanded )
 
         # save reverse complement flag
         my $revcomp = $fwdflag;
-        if ( ( $asubseq =~ m/^\-/ ) or ( $asubseq =~ m/\-$/ ) ) { $revcomp = 1; }
+        if ( ( $asubseq =~ m/^\-/ ) or ( $asubseq =~ m/\-$/ ) ) { $revcomp = '-'; }
 
         # remove "-" or "+"
         $asubseq =~ s/[\-\+]$//g;
@@ -891,7 +891,7 @@ foreach my $aseq ( @unexpanded )
             unless ( $prefix ) { $prefix = $globalprefix; }
             for ( my $i=$start; $i<=$end; $i++ )
               {
-                my $fullid = ($revcomp?'-':'').$prefix.$i.$subrange;
+                my $fullid = $revcomp.$prefix.$i.$subrange;
                 push ( @expanded, $fullid );
                 if ( $index <= 10 ) { debugmsg ( "  Saving expanded sequence \"$fullid\"" ); }
               }
@@ -916,7 +916,7 @@ foreach my $aseq ( @unexpanded )
             # trim leading zeroes
             if ( $removezeroes )
               { $number =~ s/^0+([1-9])/$1/; }
-            my $fullid = ($revcomp?'-':'').$prefix.$number.$subrange;
+            my $fullid = $revcomp.$prefix.$number.$subrange;
             debugmsg ( "Fullid = \"$fullid\"" );
             push ( @expanded, $fullid );
             if ( $index <= 10 ) { debugmsg ( "  Saving single contig \"$fullid\"" ); }
