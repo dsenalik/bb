@@ -1,0 +1,1155 @@
+#!/usr/bin/perl
+#----------------------------------------------------------#
+#        Author: Douglas Senalik dsenalik@wisc.edu         #
+#----------------------------------------------------------#
+# "Black Box" program series
+=bb
+Draw a graphical representation of a DNA sequence with annotations
+=cut bb
+use strict;
+use warnings;
+use Getopt::Long;      # for getting command line parameters
+use GD;                # for image creation
+use Cwd 'abs_path';    # for label on graph
+use Sys::Hostname;     # for label on graph
+# 1.0 - Dec 19, 2016
+my $version = "1.0";
+
+
+
+############################################################
+# configuration variables
+############################################################
+my $defaultxsize  = 1600;
+my $defaultysize  = 1200;
+my $defaultsplits = 1;
+my $defaultmajorinc = 5000;
+my $defaultminorinc = 1000;
+my $defaultticcolor = "Gray";
+my $defaultmajorticsize = 20;
+my $defaultminorticsize = 8;
+my $defaultthumbnail = 20;
+my $defaultbackground = "White";
+my $debuglimit = 50;  # stop some debug messages after this many occurrences
+
+# --preprocess configuration that is not yet a command line parameter
+my $preyincr = 30;
+my $precolorcons = 'SkyBlue';
+my $presizecons = 10;
+my $precolorpoly = 'Black'; #'SandyBrown';
+my $presizepoly = 7;
+my $precolordel = 'Red';
+my $presizedel = 2;
+my $precolorins = 'Red';
+my $presizeins = 2;
+
+
+
+############################################################
+# global variables
+############################################################
+my $ansiup      = "\033[1A";  # terminal control
+(my $prognopath = $0) =~ s/^.*[\/\\]//;
+my %colornames = loadcolors();  # text color name to RGB lookup hash
+my %allocatedcolors;
+my @data        = (); # data from all input files
+my $nobjects    = 0;  # number of ojbects to draw
+my $im;               # GD::Image object
+my $xoffset     = 0;  # used when --splits > 1
+my $yoffset     = 0;  # used when --splits > 1
+my $numxlated = 0;    # how many colors were looked up (for debugging)
+
+
+
+############################################################
+# command line parameters
+############################################################
+my @infilename  = ();   # input file names
+my $xscale;
+my $carrotlen   = 0;    # length in b.p. of sequence map
+my $infasta     = "";
+my $gdoutname   = "";   # output file name
+my $background  = "White";
+my $splits      = $defaultsplits;  # = 1 for single long linear image, number of times image wraps to new line
+my $xsize       = $defaultxsize;  # output image size without margin
+my $ysize       = $defaultysize;  # output image size
+my $xmargin     = 0;    # set to e.g. 20 if $splits is > 1 to have some duplication when line wraps
+my $markermajorincrement = $defaultmajorinc;
+my $markerminorincrement = $defaultminorinc;
+my $ticcolor    = $defaultticcolor;
+my $majorticsize = $defaultmajorticsize;
+my $minorticsize = $defaultminorticsize;
+my $noruler;
+my $offset      = 0;
+my $preprocess;
+my $preflank    = 0;
+my $prexmin;            # for --preprocess
+my $prexmax;            # for --preprocess
+my $showlabel;
+my $thicken = 0;
+my $trim;
+my $thumbnail;
+my $header      = 0;    # header in output image
+my $help        = 0;    # print help and exit
+my $quiet       = 0;    # only show errors
+my $debug       = 0;    # print extra debugging information
+GetOptions (
+            "infile=s"       => \@infilename,        # string
+            "outfile=s"      => \$gdoutname,         # string
+            "length=i"       => \$carrotlen,         # integer
+            "infasta=s"      => \$infasta,           # string
+            "background=s"   => \$background,        # string
+            "splits=i"       => \$splits,            # integer
+            "xsize=i"        => \$xsize,             # integer
+            "ysize=i"        => \$ysize,             # integer
+            "xmargin=i"      => \$xmargin,           # integer
+            "ticmajor|tickmajor=i" => \$markermajorincrement, # integer
+            "ticminor|tickminor=i" => \$markerminorincrement, # integer
+            "ticcolor|tickcolor=s" => \$ticcolor,    # integer
+            "ticsizemajor|ticksizemajor=i" => \$majorticsize, # integer
+            "ticsizeminor|ticksizeminor=i" => \$minorticsize, # integer
+            "noruler"        => \$noruler,           # flag
+            "xscale=s"       => \$xscale,            # string (real)
+            "offset:i"       => \$offset,            # integer
+            "showlabel:i"    => \$showlabel,         # flag
+            "header:s"       => \$header,            # flag or optional string
+            "trim"           => \$trim,              # flag
+            "thumbnail:s"    => \$thumbnail,         # flag or optional string = percent of original size, 0..100
+            "preprocess"     => \$preprocess,        # flag
+            "xmin=i"         => \$prexmin,           # integer
+            "xmax=i"         => \$prexmax,           # integer
+            "flank=i"        => \$preflank,          # integer
+            "thicken=i"      => \$thicken,           # integer
+            "help"           => \$help,              # flag
+            "quiet"          => \$quiet,             # flag
+            "debug"          => \$debug);            # flag
+# debug implies not quiet
+if ( $debug ) { $quiet = 0; }
+
+# check for all required parameters
+unless ( $help )
+  {
+    unless ( scalar @infilename ) { $help = 1; }
+    unless ( ( $infasta ) or ( $carrotlen ) or ( $preprocess ) or ( $xscale ) ) { $help = 1; }
+    unless ( $gdoutname ) { $help = 1; }
+  }
+
+
+
+############################################################
+# print help screen
+############################################################
+if ( $help )
+  {
+    print "$prognopath  version $version
+Required parameters:
+  --infile=xxx      input file name, multiple allowed
+                    format is tab-delimited columns of
+                    ID  start  end  shape  yheight  yposition  color  [fillcolor]  [reverseyposition]  [reversecolor]  [reversefillcolor]
+                    shape is \"R\"=rectangle or \"A\"=Arrow or \">\"=rectanglearrow ==> or \">>\"= >==>
+                    or \"L\"=Label or \"V\"=Vertical label
+                    color see http://www.w3schools.com/html/html_colornames.asp
+                    or use RGB formats 0xAABBCC or 123,134,145
+                    reverse values are used if present, and end < start
+                    split ypostion with \":\" if two y values needed
+                    shift all subsequent lines with e.g. xoffset=123 or yoffset=-456
+                    if end is blank or '=', use same value as start
+  --outfile=xxx     output image file name
+  --length=xxx      length in b.p. of the sequence map
+  or                or
+  --infasta=xxx     get length in b.p. from this FASTA file
+  or
+  --xscale=xxx      x scaling of coordinates, use 2 to scale by half
+Optional parameters:
+  --background=xxx  background color, default=\"$background\"
+  --splits=xxx      wrap drawing to this many sections
+  --xsize=xxx       image horizontal size in pixels,
+                    this size does not include --xmargin
+  --ysize=xxx       image vertical size in pixels
+                    default image size is $xsize x $ysize
+  --xmargin=xxx     set to e.g. 20 if --splits is > 1 to
+                    have some duplication when line wraps
+  --ticmajor=xxx    position of major tic marks, default=$defaultmajorinc
+  --ticminor=xxx    position of minor tic marks, default=$defaultminorinc
+  --ticcolor=xxx    color for tick marks, default=$defaultticcolor
+  --ticsizemajor=xxx  vertical height of major tic marks, default=$defaultmajorticsize
+  --ticsizeminor=xxx  vertical height of minor tic marks, default=$defaultminorticsize
+  --noruler         disable ruler entirely
+  --offset=xxx      subtract this value from all x coordinates (start and
+                    end, columns 2 and 3) in the data file
+  --showlabel       print the label from the data file horizontally
+  --showlabel=2     print the label from the data file vertically
+  --header          print default header on output image
+  --header=xxx      print this header on output image, %d can be used for date
+  --thicken=xxx     increase all right coordinates by this amount
+  --trim            run imagemagick trim command to remove borders
+  --thumbnail       create a thumbnail at $defaultthumbnail\% of original size
+  --thumbnail=xxx   create a thumbnail at specified reduction, 1..99
+  --preprocess      In this mode, --infile is a table generated by bb.fastaconsensus,
+                    and --outfile will be a data file for this program
+  --flank=xxx       for --preprocess, add this much flanking to each end
+  --xmin=xxx        for --preprocess, specify the starting and
+  --xmax=xxx          ending coordinates for the generated file
+  --help            print this screen
+  --quiet           only print error messages
+  --debug           print extra debugging information
+";
+    exit 1;
+  } # if ( $help )
+
+
+
+############################################################
+# special --preprocess mode
+############################################################
+if ( $preprocess )
+  {
+    preprocessconvert ( $gdoutname, @infilename );
+    exit 0;
+  }
+
+
+
+############################################################
+# get length from input FASTA file if using this method
+############################################################
+if ( $infasta )
+  {
+    debugmsg ( "Reading sequence length from input FASTA file \"$infasta\"" );
+    my $nseq = 0;
+    $carrotlen = 0;
+    my $INF = stdopen( '<', $infasta );
+    while ( my $aline = <$INF> )
+      {
+        if ( $aline =~ m/^>/ )
+          { $nseq++; }
+        else
+          {
+            # count only letters
+            while ( $aline =~ m/[A-Za-z]/g )
+              { $carrotlen++ }
+          }
+      } # while ( my $aline = <$INF> )
+    stdclose( $INF );
+    unless ( $quiet ) { print "Sequence length from FASTA file = $carrotlen ( $nseq sequences in file )\n"; }
+  } # if ( $infasta )
+
+
+
+############################################################
+# more global variables dependent on command line parameters
+############################################################
+unless ( defined $xscale ) { $xscale = ( $carrotlen / ( $xsize * $splits ) ); }
+my $ycenter = int ( $ysize / $splits / 2 );
+#my $y1 = $ycenter - 8;
+#my $y2 = $ycenter + 8;
+$yoffset = $ycenter;
+debugmsg ( "xscale=$xscale ycenter=$ycenter yoffset=$yoffset" );
+unless ( $xscale ) { die "Error, xscale is zero xsize=$xsize length=$carrotlen\n"; }
+
+
+
+############################################################
+# load all input files to 2-dimensional @data array 
+############################################################
+{
+foreach my $afile ( @infilename )
+  {
+    debugmsg ( "Reading input file \"$afile\"" );
+    my $nlines = 0;
+    my $offsetx = 0;
+    my $offsety = 0;
+    my $INF = stdopen( '<', $afile );
+    while ( my $aline = <$INF> )
+      {
+        $nlines++;
+        $aline =~ s/[\r\n]//g;
+        $aline =~ s/^ *#.*$//;  # remove comments
+        next unless ( $aline );  # skip blank lines
+        if ( $aline =~ m/xoffset[^\-\d]*([\-\d]+)/i )
+          { $offsetx = $1; }
+        elsif ( $aline =~ m/yoffset[^\-\d]*([\-\d]+)/i )
+          { $offsety = $1; }
+        else
+          {
+            my @cols = split ( /\t/, $aline );
+            if ( scalar @cols > 1 )
+              {
+                # null, space, or '=' in end column to use same as start
+                if ( ( defined $cols[2] ) and
+                     ( ( $cols[2] =~ m/^[ =]$/ ) or ( $cols[2] =~ m/^$/ ) ) )
+                  { $cols[2] = $cols[1]; }
+                if ( $cols[1] =~ m/[\-\+]/ )
+                  { $cols[1] = math($cols[1]) }
+                if ( $cols[2] =~ m/[\-\+]/ )
+                  { $cols[2] = math($cols[2]) }
+                if ( $offset ) # command line parameter
+                  {
+                    $cols[1] -= $offset;
+                    $cols[2] -= $offset;
+                  }
+                # offsets defined in the data file
+                $cols[1] += $offsetx;
+                $cols[2] += $offsetx;
+                $cols[5] += $offsety;
+
+                if ( $thicken )
+                  {
+                    if ( $cols[2] > $cols[1] )
+                      { $cols[2] += $thicken }
+                    else
+                      { $cols[1] += $thicken }
+                  }
+
+                $data[$nobjects] = \@cols;
+                $nobjects++;
+              }
+            else
+              { print "Warning, short line # $nlines = \"$aline\"\n"; }
+          }
+      } # while <$INF>
+    stdclose( $INF );
+    debugmsg ( "File contained $nlines lines, now have $nobjects data objects loaded" );
+  } # foreach my $afile ( @infilename )
+  unless ( $quiet ) { print "$nobjects objects loaded from input file(s)\n"; }
+}
+
+
+
+############################################################
+# initialize image
+############################################################
+# initialize image
+debugmsg ( "Initialize image of ".(int($xsize)+$xmargin*2)." x ".int($ysize)." pixels" );
+$im = new GD::Image( int($xsize)+$xmargin*2, int($ysize) );
+# first allocated color becomes the background color, so allocate it now
+my $bg = colorxlate( $background );
+
+
+
+
+############################################################
+# image generation loop
+############################################################
+# outer loop if splitting and wrapping image
+for my $s ( 1 .. $splits )
+  {
+    # shift image if wrapping based on --splits parameter
+    if ( $s > 1 )
+      {
+        $xoffset -= $xsize;
+        $yoffset += int ( $ysize / $splits );
+      }
+    debugmsg ( "Splits loop $s/$splits: xoffset=$xoffset yoffset=$yoffset" );
+
+
+
+    # line representing whole sequence with tic marks
+    unless ( $noruler )
+      {
+        my $linecolor = colorxlate ( "$ticcolor" );
+        $im->line( $xmargin+$xoffset, $yoffset, (int($carrotlen / $xscale + 0.5) + $xmargin+$xoffset), $yoffset, $linecolor);
+        if ( ( $markermajorincrement ) or ( $markerminorincrement ) )
+          {
+            my $marker = 0;
+            while ( $marker <= $carrotlen )
+              {
+                my $pos = (int($marker / $xscale + 0.5) + $xmargin+$xoffset);
+
+                if ( ( $markermajorincrement ) and ( ( $marker % $markermajorincrement ) == 0 ) )
+                  { 
+                    debugmsg ( "Major tic at marker=$marker pos=$pos" );
+                    $im->line( $pos, $yoffset-$majorticsize, $pos, $yoffset+$majorticsize, $linecolor );
+                    $im->stringUp( gdSmallFont, $pos-7, $yoffset-$majorticsize-5, commify($marker), $linecolor );
+                  }
+                else
+                  {
+                    debugmsg ( "Minor tic at marker=$marker pos=$pos" );
+                    $im->line( $pos, $yoffset-$minorticsize, $pos, $yoffset+$minorticsize, $linecolor);
+                  }
+
+                # either major or minor increment is allowed to be 0, so 
+                # increment by the smaller of the non-zero variables
+                if ( $markerminorincrement )
+                  { $marker += $markerminorincrement; }
+                else
+                  { $marker += $markermajorincrement; }
+              } # while
+          } # if ( ( $markermajorincrement ) or ( $markerminorincrement ) )
+      } # unless $noruler
+
+
+
+    # process each stored object and draw it
+    my $elementindex = 0;
+    foreach my $objref ( @data )
+      {
+        # columns are [0]ID  [1]start  [2]end  [3]shape  [4]yheight  [5]yposition  [6]color  
+        #             [7][fillcolor]  [8][reverseyposition]  [9][reversecolor]  [10][reversefillcolor]
+        my $filled = ( defined $objref->[7] );
+        my $reverse = ( $objref->[2] < $objref->[1] );  # save orientation before scaling, in case object reduces to 1 pixel
+        my $optpos = 5;
+        my $optcol = 6;
+        my $optfil = 7;
+        my $lblyoffs = -18;
+        my $x1 = int($objref->[1]/$xscale+0.5)+$xmargin+$xoffset;
+        my $x2 = int($objref->[2]/$xscale+0.5)+$xmargin+$xoffset;
+        my $lblx = $x1 + 0;
+        if ( $reverse )
+          {
+            if ( defined $objref->[8] ) { $optpos = 8; }
+            if ( defined $objref->[9] ) { $optcol = 9; }
+            if ( defined $objref->[10] ) { $optfil = 10; }
+            $lblyoffs = 10;
+            $lblx = $x2 - 0;
+          }
+        my $fillcolorid;
+        if ( $filled ) { $fillcolorid = colorxlate($objref->[$optfil]); } else { $fillcolorid = ""; }
+        if ( $objref->[3] eq "R" )  # rectangle
+          {
+            if ( ( $filled ) and ( $fillcolorid ) )
+              {
+                if ( $elementindex <= $debuglimit ) { debugmsg ( "filled rectangle ( $x1, ".($yoffset-$objref->[4]).", $x2, ".($yoffset+$objref->[4]).", $fillcolorid )" ); }
+                $im->filledRectangle(
+                  $x1,
+                  $yoffset-$objref->[4]-$objref->[$optpos],
+                  $x2,
+                  $yoffset+$objref->[4]-$objref->[$optpos],
+                  $fillcolorid );
+              } # fill
+            if ( $objref->[$optcol] )  # if undefined or false, no border around rectangle
+              {
+                if ( $elementindex <= $debuglimit ) { debugmsg ( "rectangle ( $x1, ".($yoffset-$objref->[4]).", $x2, ".($yoffset+$objref->[4]).", ".$fillcolorid." )" ); }
+                $im->rectangle(
+                  $x1,
+                  $yoffset-$objref->[4]-$objref->[$optpos],
+                  $x2,
+                  $yoffset+$objref->[4]-$objref->[$optpos],
+                  colorxlate($objref->[$optcol]) );
+              }
+            if ( defined $showlabel )
+              {
+                if ( $showlabel==2 )
+                  { $im->stringUp( gdSmallFont, $lblx, $yoffset-$objref->[$optpos]+$lblyoffs, $objref->[0], colorxlate("Black") ); }
+                else
+                  { $im->string( gdSmallFont, $lblx, $yoffset-$objref->[$optpos]+$lblyoffs, $objref->[0], colorxlate("Black") ); }
+              }
+          } # rectangle
+
+        elsif ( $objref->[3] eq "A" )  # arrow
+          {
+            # x1 x2 reverseflag y1 y2 color label
+            my @ys = split ( /:/, $objref->[5] );
+            unless ( $ys[1] ) { $ys[1] = $ys[0] }
+            if ( $elementindex <= $debuglimit ) { debugmsg ( "arrow ( $x1, $x2, $reverse, ".($yoffset-$ys[0]).", ".($yoffset-$ys[1]).", ".colorxlate($objref->[6]).", ".$objref->[0].", 0, 0 )" ); }
+            arrow( $x1, $x2, $reverse, $yoffset-$ys[0], $yoffset-$ys[1], colorxlate($objref->[6]), $objref->[0], 0, 0 );
+          } # arrow
+
+        elsif ( $objref->[3] =~ m/>/ )  # > rectangle arrow [==> or >> double arrow >==>
+          {
+            my @ys = split ( /:/, $objref->[5] );
+            unless ( $ys[1] ) { $ys[1] = $ys[0] }
+            if ( $elementindex <= $debuglimit ) { debugmsg ( "arrow ( $x1, $x2, $reverse, ".($yoffset-$ys[0]).", ".($yoffset-$ys[1]).", ".colorxlate($objref->[6]).", ".$objref->[0].", 0, 1 )" ); }
+            arrow( $x1, $x2, $reverse, $yoffset-$objref->[4]-$objref->[$optpos], $yoffset+$objref->[4]-$objref->[$optpos], colorxlate($objref->[6]), $objref->[0], ($objref->[3]=~m/>>/)?1:0, 1 );
+          } # rectanglearrow
+
+        elsif ( $objref->[3] eq "L" )  # label
+          {
+            if ( $elementindex <= $debuglimit ) { debugmsg ( "label ( $x1, $x2, $reverse, ".($yoffset-$objref->[4]).", ".colorxlate($objref->[6]).", ".$objref->[0]." )" ); }
+            my $x = $lblx;
+#            if ( $x2 )
+#              { $x = int ( ( $x1 + $x2 ) / 2 + 0.5 ); }  # midpoint of two x values if both specified
+            $im->string( gdLargeFont, $x, $yoffset-$objref->[5], $objref->[0], colorxlate($objref->[6]) );
+          } # label
+        elsif ( $objref->[3] eq "V" )  # vertical label
+          {
+            if ( $elementindex <= $debuglimit ) { debugmsg ( "label ( $x1, $x2, $reverse, ".($yoffset-$objref->[4]).", ".colorxlate($objref->[6]).", ".$objref->[0]." )" ); }
+            my $x = $lblx;
+            $im->stringUp( gdLargeFont, $x, $yoffset-$objref->[5], $objref->[0], colorxlate($objref->[6]) );
+          } # vertical label
+
+        else
+          { die "Error, invalid shape \"$objref->[3]\" element $elementindex\n"; }
+
+        $elementindex++;
+
+      } # foreach my $objref ( @data )
+
+  } # for $s
+
+
+
+############################################################
+# some text labels on the final image
+############################################################
+if ( $header ne 0 )
+  {
+    if ( $header )
+      {
+        my $t = timestr();
+        $header =~ s|\%d|$t|g;  # special string %d is replaced with current date+time 
+      }
+    else  # $header eq ""
+      { $header = hostname . "  " . abs_path($0) . "   " . timestr(); }
+    $im->string( gdSmallFont, 1, 1, $header, colorxlate ( "Black" ) );
+  } # if ( $header )
+
+
+
+############################################################
+# save image
+############################################################
+my $OUTF4 = stdopen( '>', $gdoutname );
+binmode $OUTF4;
+print $OUTF4 $im->png;
+stdclose( $OUTF4 );
+
+
+
+############################################################
+# optional --trim operation
+############################################################
+if ( $trim )
+  {
+    my $cmd = "mogrify -trim +repage \"$gdoutname\"";
+    my $result = system ( $cmd );
+    if ( $result )
+      { print "Error $result trimming image with command \"$cmd\"\n"; }
+  }
+
+
+
+############################################################
+# create optional thumbnail image
+############################################################
+if ( defined $thumbnail )
+  {
+    # value of 0 indicates use default percentage
+    unless ( $thumbnail ) { $thumbnail = $defaultthumbnail }
+    my $thumbnailfile = $gdoutname;
+    if ( $thumbnailfile =~ m/^(.*\.)([^\.]+)$/ )
+      { $thumbnailfile = $1 . 'tn.jpg' }
+    else
+      { $thumbnailfile .= '.tn.jpg'; }
+    my $cmd = "convert -resize $thumbnail\% -quality 30 \"$gdoutname\" \"$thumbnailfile\"";
+    my $result = system ( $cmd );
+    if ( $result )
+      { print "Error $result creating thumbnail image with command \"$cmd\"\n"; }
+  } # if ( defined $thumbnail )
+
+
+
+exit 0;
+
+
+
+############################################################
+sub arrow { my ( $x1, $x2, $reverse, $y1, $y2, $color, $label, $leftend, $rightend ) = @_;
+############################################################
+  my @points = ();
+  unless ( $leftend or $rightend )
+    {
+      if ( $y1 == $y2 )
+        {
+          $im->line($x1, $y1, $x2, $y1, $color);
+          if ( $reverse )   # reverse arrow
+            {
+              $points[0] = $x2;
+              $points[1] = $y1;
+              $points[2] = $x2+4;
+              $points[3] = $y1+2;
+              $points[4] = $x2+4;
+              $points[5] = $y1-2;
+              $points[6] = $x2;  # for label position
+            }
+          else               # forward arrow
+            {
+              $points[0] = $x2;
+              $points[1] = $y1;
+              $points[2] = $x2-4;
+              $points[3] = $y1+2;
+              $points[4] = $x2-4;
+              $points[5] = $y1-2;
+              $points[6] = $x1;
+            }
+          my $poly = new GD::Polygon;
+          foreach my $i ( 0, 2, 4 )
+            { $poly->addPt($points[$i], $points[$i+1] ); }
+          $im->filledPolygon($poly,$color);
+        } # if ( $y1 == $y2 )
+      else  # vertical arrow
+        {
+# not fully tested yet
+          $im->line($x1, $y1, $x2, $y2, $color);
+          if ( $reverse )   # reverse arrow = pointing up
+            {
+              $points[0] = $x1-2;
+              $points[1] = $y1;
+              $points[2] = $x1;
+              $points[3] = $y1-2;
+              $points[4] = $x1+2;
+              $points[5] = $y1;
+              $points[6] = $x1;  # for label position
+            }
+          else               # forward arrow = pointing down
+            {
+              $points[0] = $x1-4;
+              $points[1] = $y1+4;
+              $points[2] = $x1;
+              $points[3] = $y1;
+              $points[4] = $x1+4;
+              $points[5] = $y1+4;
+              $points[6] = $x1;
+            }
+          my $poly = new GD::Polygon;
+          foreach my $i ( 0, 2, 4 )
+            { $poly->addPt($points[$i], $points[$i+1] ); }
+          $im->filledPolygon($poly,$color);
+
+        } # else vertical arrow
+      if ( $label )
+        { $im->string(gdSmallFont,$x1,$y1+4,$label,$color); }
+    } # unless ( $leftend or $rightend )
+  else  # rectanglearrow
+    {
+      if ( 1 )
+        {
+
+          my $xoffset = int ( abs ( $y2 - $y1 ) / 2 );
+          my $ymid = int ( ( $y1 + $y2 ) / 2 );
+
+          # if arrow is shorter than height, artifact would occur
+          if ( $xoffset > abs ( $x2 - $x1 ) ) { $xoffset = abs ( $x2 - $x1 ); }
+
+#print "x1=$x1 x2=$x2 y1=$y1 y2=$y2 xoffset=$xoffset ymid=$ymid leftend=$leftend rightend=$rightend label=\"$label\"\n"; #@@@
+          my $poly = new GD::Polygon;
+          if ( $reverse )   # reverse arrow   <===| or <===<
+            {
+              $poly->addPt( $x2+($rightend * $xoffset), $y1 );
+              $poly->addPt( $x1, $y1 );
+              $poly->addPt( $x1+($leftend * -$xoffset), $ymid );
+              $poly->addPt( $x1, $y2 );
+              $poly->addPt( $x2+($rightend * $xoffset), $y2 );
+              $poly->addPt( $x2, $ymid );
+            }
+          else               # forward arrow  |===> or >===>
+            {
+              $poly->addPt( $x1, $y1 );
+              $poly->addPt( $x2+($rightend * -$xoffset), $y1 );
+              $poly->addPt( $x2, $ymid );
+              $poly->addPt( $x2+($rightend * -$xoffset), $y2 );
+              $poly->addPt( $x1, $y2 );
+              $poly->addPt( $x1+($leftend * $xoffset), $ymid );
+            }
+          $im->filledPolygon($poly,$color);
+        } # if ( 1 )
+    }
+} # sub arrow
+
+
+
+############################################################
+sub debugmsg { my ( $text, $noreturn, $nolinenum ) = @_;
+############################################################
+  if ( $debug )
+    {
+      my ($package, $filename, $line, $sub) = caller(0);
+      unless ( $nolinenum ) { $text = "Line $line: " . $text; }
+      if ( ! ( $noreturn ) ) { $text .= "\n"; }
+      print $text;
+    } # if ( $debug )
+} # sub debugmsg
+
+
+
+###############################################################
+sub timestr {
+###############################################################
+  @_ = localtime(shift || time);
+  return(sprintf("%04d/%02d/%02d %02d:%02d", $_[5]+1900, $_[4]+1, $_[3], @_[2,1]));
+} # sub timestr
+
+
+
+###############################################################
+sub commify {
+###############################################################
+# http://perldoc.perl.org/perlfaq5.html#How-can-I-output-my-numbers-with-commas
+  local $_ = shift;
+  1 while s/^([-+]?\d+)(\d{3})/$1,$2/;
+  return $_;
+} # commify
+
+
+
+###############################################################
+sub math { my ( $text ) = @_;
+###############################################################
+  # do any embedded math operations on string
+  eval ( "\$text = ( $text )" );
+  return $text;
+} # sub math
+
+
+
+###############################################################
+sub preprocessconvert { my ( $outfilename, @infilenames ) = @_;
+###############################################################
+# converts a table from bb.fastaconsensus --table
+# into an input file suitable for this program
+  my $OUTF = stdopen( '>', $outfilename );
+  print $OUTF join( "\t", '#ID', 'start', 'end', 'shape', 'yheight', 'yposition', 'color', '[fillcolor]', '[reverseyposition]', '[reversecolor]', '[reversefillcolor]' ), "\n";
+  foreach my $infilename ( @infilenames )
+    {
+      my @header;
+      my @lines;
+      my $nlines = 0;
+      my $INF = stdopen( '<', $infilename );
+      while ( my $aline = <$INF> )
+        {
+          $nlines++;
+          $aline =~ s/[\r\n]//g;
+          my @cols = split( /\t/, $aline );
+          if ( $nlines == 1 )
+            { @header = @cols; }
+          else
+            { push( @lines, \@cols ); }
+        } # while $INF
+      stdclose( $INF );
+
+    my $yoffset = 0;
+    my $seqend;
+    my $seqstart = $lines[0]->[0];
+    if ( defined $prexmin ) { $seqstart = $prexmin; }
+    $seqstart -= $preflank;
+    print $OUTF "xoffset=".(0-$seqstart)."\n";
+    for my $i ( 3..$#header )
+      {
+        $yoffset -= $preyincr;
+        my $id = $header[$i];
+        debugmsg( "Processing column $i \"$id\"" );
+        my $prevstate;
+        my $prevstart;
+        my $prevstop;
+        my $state;
+        my $start;
+        my $stop;
+        for my $j ( 0..$#lines )
+          {
+            $state = $lines[$j]->[$i];
+            $start = $lines[$j]->[0];
+            $stop = $lines[$j]->[1];
+            next if ( $state eq '.' );  #@@@ test
+
+            # clip or drop regions outside specified range
+            if ( ( defined $prexmin ) and ( $start < $prexmin ) ) { $start = $prexmin; }
+            if ( ( defined $prexmin ) and ( $stop < $prexmin ) ) { next; }
+            if ( ( defined $prexmax ) and ( $start > $prexmax ) ) { next; }
+            if ( ( defined $prexmax ) and ( $stop > $prexmax ) ) { $stop = $prexmax; }
+
+            debugmsg( "start=$start stop=$stop state=\"$state\"" );
+
+            # first block, generate optional flanking at beginning
+            unless ( defined $prevstart )
+              {
+                if ( ( defined $prexmin ) and ( $start > $prexmin ) )
+                  {
+                    $prevstart = $prexmin;
+                    $prevstop = $start - 1;
+                    $prevstate = '.';
+                    $seqstart = $prevstart;  # used only for message printed at end
+                  }
+                if ( $preflank )
+                  {
+                    $prevstart = $start - $preflank;
+                    $prevstop = $start - 1;
+                    $prevstate = '.';
+                    $seqstart = $prevstart;
+                  }
+                if ( defined $prevstart )
+                  { debugmsg( "Generated initial block $prevstart..$prevstop state \"$prevstate\"" ); }
+              } # first block
+
+            # consensus blocks may be missing, adjust here
+            if ( defined $prevstate )
+              {
+                if ( $prevstop != ( $start - 1 ) )
+                  {
+                    if ( $prevstate eq '.' )
+                      { $prevstop = $start - 1; }
+                    else
+                      {
+                        print $OUTF preprocessdrawblock( $id, $prevstart, $prevstop, $prevstate, $yoffset );
+                        # this generates the missing consensus block
+                        $prevstart = $prevstop+1;
+                        $prevstop = $start - 1;
+                        debugmsg( "$i \"$id\" Generate missing block $prevstart..$prevstop after state $prevstate before state $state" );
+                        $prevstate = '.';
+                      }
+                  } # if missing block
+              } # if ( defined $prevstate )
+
+            if ( ( ! defined $prevstate ) or ( $state ne $prevstate ) )
+              {
+                if ( defined $prevstate )
+                  { print $OUTF preprocessdrawblock( $id, $prevstart, $prevstop, $prevstate, $yoffset ); }
+                $prevstate = $state;
+                $prevstart = $start;
+              }
+            $prevstop = $stop;
+
+          } # for $j
+
+        # do last block, and generate flanking at end
+        print $OUTF preprocessdrawblock( $id, $prevstart, $prevstop, $prevstate, $yoffset );
+
+        $seqend = $prexmax // $stop;
+        $seqend += $preflank;
+        if ( $prevstop < $seqend )
+          {
+            # generate a trailing consensus block
+            $state = '.';
+            print $OUTF preprocessdrawblock( $id, $prevstop+1, $seqend, $state, $yoffset );
+            debugmsg( "Generated trailing block ".($prevstop+1)."..$seqend state \"$state\" after state \"$prevstate\" ending at $stop" );
+          }
+        else
+          { debugmsg( "No trailing block generated after state \"$prevstate\" prevstop=$prevstop seqend=$seqend" ); }
+
+        # genotype label
+        print $OUTF join ( "\t", $id, 1, '=', 'L', 10, $yoffset, 'black' ), "\n";
+
+      } # for $i
+      print "Sequence length for --length parameter is ".($seqend-$seqstart+1)."\n";
+    } # for $infilename
+  stdclose( $OUTF );
+
+} # sub preprocessconvert
+
+
+
+###############################################################
+sub preprocessdrawblock { my ( $id, $start, $stop, $state, $yoffset ) = @_;
+###############################################################
+  my @block = ( $id, $start, $stop, 'R' );
+  if ( $state eq '.' )
+    { push( @block, $presizecons, $yoffset, 0, $precolorcons ); }
+  elsif ( $state eq 'P' )
+    { push( @block, $presizepoly, $yoffset, 0, $precolorpoly ); }
+  elsif ( $state eq 'D' )
+    { push( @block, $presizedel, $yoffset, 0, $precolordel ); }
+  elsif ( $state eq 'I' )
+    { push( @block, $presizeins, $yoffset, 0, $precolorins ); }
+  debugmsg( 'Draw block "'.join('", "', @block ).'"' );
+  return( join( "\t", @block )."\n" );
+} # sub preprocessdrawblock
+
+
+
+###############################################################
+sub colorxlate { my ( $colorname ) = @_;
+###############################################################
+  $colorname = lc($colorname);  # not case sensitive
+  my $colorkey = $allocatedcolors{$colorname};  # might be undefined
+  if ( defined $colornames{$colorname} )
+    {
+      my @rgb = @{$colornames{$colorname}};
+      $numxlated++;
+      if ( $numxlated <= $debuglimit ) { debugmsg ( "colorxlate \"$colorname\" to \"$rgb[0]\" \"$rgb[1]\" \"$rgb[2]\"" ); }
+
+      # transparent colors, return a zero
+      if ( ( $colorname =~ m/Clear/i ) or ( $colorname =~ m/Transparent/i ) or ( $colorname =~ m/None/i ) )
+        { return 0; }
+
+      # define this color if it has not yet been used
+      unless ( $colorkey )
+        {
+          debugmsg ( "New color needs definition: \"$colorname\" = red:\"$rgb[0]\" green:\"$rgb[1]\" blue:\"$rgb[2]\"" );
+          $colorkey = $im->colorAllocate( $rgb[0], $rgb[1], $rgb[2] );
+          $allocatedcolors{$colorname} = $colorkey;
+        }
+    }
+  elsif ( $colorname =~ m/^0x(..)(..)(..)$/i )  # e.g. "0xF0E88C"
+    {
+      my $R = hex($1) or die "Error, value \"$1\" in color \"$colorname\" not a hexadecimal value\n";
+      my $G = hex($2) or die "Error, value \"$2\" in color \"$colorname\" not a hexadecimal value\n";
+      my $B = hex($3) or die "Error, value \"$3\" in color \"$colorname\" not a hexadecimal value\n";
+      # define this color if it has not yet been used
+      unless ( $colorkey )
+        {
+          debugmsg ( "New color needs definition: \"$colorname\" as explicit RGB" );
+          $colorkey = $im->colorAllocate( $R, $G, $B );
+          $allocatedcolors{$colorname} = $colorkey;
+        }
+    }
+  elsif ( $colorname =~ m/(\d+),(\d+),(\d+)/ )  # e.g. "252,205,229"
+    {
+      my $R = $1;
+      my $G = $2;
+      my $B = $3;
+      # define this color if it has not yet been used
+      unless ( $colorkey )
+        {
+          debugmsg ( "New color needs definition: \"$colorname\" as explicit RGB" );
+          $colorkey = $im->colorAllocate( $R, $G, $B );
+          $allocatedcolors{$colorname} = $colorkey;
+        }
+    }
+  else
+    {
+      die ( "Error, undefined color name \"$colorname\"\nCheck this web site for valid colors\nhttp://www.w3schools.com/html/html_colornames.asp\n" );
+    }
+  # return the color identifier, whether new or previously defined
+  return $colorkey;
+} # sub colorxlate
+
+
+
+###############################################################
+sub loadcolors {
+###############################################################
+# from http://www.w3schools.com/html/html_colornames.asp
+  my %tmp1 = (
+    "AliceBlue" => "F0F8FF",
+    "AntiqueWhite" => "FAEBD7",
+    "Aqua" => "00FFFF",
+    "Aquamarine" => "7FFFD4",
+    "Azure" => "F0FFFF",
+    "Beige" => "F5F5DC",
+    "Bisque" => "FFE4C4",
+    "Black" => "000000",
+    "BlanchedAlmond" => "FFEBCD",
+    "Blue" => "0000FF",
+    "BlueViolet" => "8A2BE2",
+    "Brown" => "A52A2A",
+    "BurlyWood" => "DEB887",
+    "CadetBlue" => "5F9EA0",
+    "Chartreuse" => "7FFF00",
+    "Chocolate" => "D2691E",
+    "Coral" => "FF7F50",
+    "CornflowerBlue" => "6495ED",
+    "Cornsilk" => "FFF8DC",
+    "Crimson" => "DC143C",
+    "Cyan" => "00FFFF",
+    "DarkBlue" => "00008B",
+    "DarkCyan" => "008B8B",
+    "DarkGoldenRod" => "B8860B",
+    "DarkGray" => "A9A9A9",
+    "DarkGrey" => "A9A9A9",
+    "DarkGreen" => "006400",
+    "DarkKhaki" => "BDB76B",
+    "DarkMagenta" => "8B008B",
+    "DarkOliveGreen" => "556B2F",
+    "Darkorange" => "FF8C00",
+    "DarkOrchid" => "9932CC",
+    "DarkRed" => "8B0000",
+    "DarkSalmon" => "E9967A",
+    "DarkSeaGreen" => "8FBC8F",
+    "DarkSlateBlue" => "483D8B",
+    "DarkSlateGray" => "2F4F4F",
+    "DarkSlateGrey" => "2F4F4F",
+    "DarkTurquoise" => "00CED1",
+    "DarkViolet" => "9400D3",
+    "DeepPink" => "FF1493",
+    "DeepSkyBlue" => "00BFFF",
+    "DimGray" => "696969",
+    "DimGrey" => "696969",
+    "DodgerBlue" => "1E90FF",
+    "FireBrick" => "B22222",
+    "FloralWhite" => "FFFAF0",
+    "ForestGreen" => "228B22",
+    "Fuchsia" => "FF00FF",
+    "Gainsboro" => "DCDCDC",
+    "GhostWhite" => "F8F8FF",
+    "Gold" => "FFD700",
+    "GoldenRod" => "DAA520",
+    "Gray" => "808080",
+    "Grey" => "808080",
+    "Green" => "008000",
+    "GreenYellow" => "ADFF2F",
+    "HoneyDew" => "F0FFF0",
+    "HotPink" => "FF69B4",
+    "IndianRed" => "CD5C5C",
+    "Indigo" => "4B0082",
+    "Ivory" => "FFFFF0",
+    "Khaki" => "F0E68C",
+    "Lavender" => "E6E6FA",
+    "LavenderBlush" => "FFF0F5",
+    "LawnGreen" => "7CFC00",
+    "LemonChiffon" => "FFFACD",
+    "LightBlue" => "ADD8E6",
+    "LightCoral" => "F08080",
+    "LightCyan" => "E0FFFF",
+    "LightGoldenRodYellow" => "FAFAD2",
+    "LightGray" => "D3D3D3",
+    "LightGrey" => "D3D3D3",
+    "LightGreen" => "90EE90",
+    "LightPink" => "FFB6C1",
+    "LightSalmon" => "FFA07A",
+    "LightSeaGreen" => "20B2AA",
+    "LightSkyBlue" => "87CEFA",
+    "LightSlateGray" => "778899",
+    "LightSlateGrey" => "778899",
+    "LightSteelBlue" => "B0C4DE",
+    "LightYellow" => "FFFFE0",
+    "Lime" => "00FF00",
+    "LimeGreen" => "32CD32",
+    "Linen" => "FAF0E6",
+    "Magenta" => "FF00FF",
+    "Maroon" => "800000",
+    "MediumAquaMarine" => "66CDAA",
+    "MediumBlue" => "0000CD",
+    "MediumOrchid" => "BA55D3",
+    "MediumPurple" => "9370D8",
+    "MediumSeaGreen" => "3CB371",
+    "MediumSlateBlue" => "7B68EE",
+    "MediumSpringGreen" => "00FA9A",
+    "MediumTurquoise" => "48D1CC",
+    "MediumVioletRed" => "C71585",
+    "MidnightBlue" => "191970",
+    "MintCream" => "F5FFFA",
+    "MistyRose" => "FFE4E1",
+    "Moccasin" => "FFE4B5",
+    "NavajoWhite" => "FFDEAD",
+    "Navy" => "000080",
+    "OldLace" => "FDF5E6",
+    "Olive" => "808000",
+    "OliveDrab" => "6B8E23",
+    "Orange" => "FFA500",
+    "OrangeRed" => "FF4500",
+    "Orchid" => "DA70D6",
+    "PaleGoldenRod" => "EEE8AA",
+    "PaleGreen" => "98FB98",
+    "PaleTurquoise" => "AFEEEE",
+    "PaleVioletRed" => "D87093",
+    "PapayaWhip" => "FFEFD5",
+    "PeachPuff" => "FFDAB9",
+    "Peru" => "CD853F",
+    "Pink" => "FFC0CB",
+    "Plum" => "DDA0DD",
+    "PowderBlue" => "B0E0E6",
+    "Purple" => "800080",
+    "Red" => "FF0000",
+    "RosyBrown" => "BC8F8F",
+    "RoyalBlue" => "4169E1",
+    "SaddleBrown" => "8B4513",
+    "Salmon" => "FA8072",
+    "SandyBrown" => "F4A460",
+    "SeaGreen" => "2E8B57",
+    "SeaShell" => "FFF5EE",
+    "Sienna" => "A0522D",
+    "Silver" => "C0C0C0",
+    "SkyBlue" => "87CEEB",
+    "SlateBlue" => "6A5ACD",
+    "SlateGray" => "708090",
+    "SlateGrey" => "708090",
+    "Snow" => "FFFAFA",
+    "SpringGreen" => "00FF7F",
+    "SteelBlue" => "4682B4",
+    "Tan" => "D2B48C",
+    "Teal" => "008080",
+    "Thistle" => "D8BFD8",
+    "Tomato" => "FF6347",
+    "Turquoise" => "40E0D0",
+    "Violet" => "EE82EE",
+    "Wheat" => "F5DEB3",
+    "White" => "FFFFFF",
+    "WhiteSmoke" => "F5F5F5",
+    "Yellow" => "FFFF00",
+    "YellowGreen" => "9ACD32"
+  ); # %tmp1
+
+  # convert these hex codes to array of 3 values in decimal
+  my %tmp2;
+  while ( my ($key, $value) = each(%tmp1) )
+    {
+      my @rgb = unpack( "(A2)*", $value );  # creates array of 3 elements
+      foreach ( @rgb ) { $_ = hex($_); }    # convert them to decimal
+      push ( @rgb, 0 );                     # array element [3] used for "is allocated" flag
+      $tmp2{lc($key)} = \@rgb;              # put array reference in hash, key not case sensitive
+    }
+
+  # return the lookup hash table
+  return( %tmp2 );
+
+} # sub loadcolors
+
+
+
+###############################################################
+sub stdopen { my ( $mode, $filename, $extratext ) = @_;
+###############################################################
+# a replacement for the three-parameter open which also allows
+# the use of "-" as the file name to mean STDIN or STDOUT
+  my $fh;  # the file handle
+  if ( $filename eq "-" )  # only exact match to "-" has special meaning
+    {
+      if ( $mode =~ m/>/ )
+        { $fh = *STDOUT }
+      else
+        { $fh = *STDIN }
+    }
+  else
+    {
+      # supplemental passed text for error messages, need one more space
+      if ( defined $extratext )
+        { $extratext .= " " }
+      else
+        { $extratext = "" }
+
+      my $text;  # this is only used for error message
+      if ( $mode =~ m/^\+?>>/ )  # ">>" or "+>>"
+        { $text = "append" }
+      elsif ( $mode =~ m/^\+?>/ )  # ">" or "+>"
+        { $text = "output" }
+      elsif ( $mode =~ m/^\+?</ )  # "<" or "+<"
+        { $text = "input" }
+      elsif ( $mode eq "-|" )
+        { $text = "piped input" }
+      elsif ( $mode eq "|-" )
+        { $text = "piped output" }
+      else
+        { die "Error, unsupported file mode \"$mode\" specified to stdopen( $mode, $filename, $extratext )\n"; }
+
+      # if file name ends in ".gz", gzip compression is assumed, and handle it transparently
+      if ( $filename =~ m/\.gz$/ )
+        {
+          if ( $mode =~ m/^>$/ ) # output mode
+            { $mode = "|-"; $filename = "gzip -c > \"$filename\""; }
+          elsif ( $mode =~ m/^<$/ ) # input mode
+            { $mode = "-|"; $filename = "gunzip -c \"$filename\""; }
+          elsif ( $mode =~ m/^>>$/ ) # append mode
+            { $mode = "|-"; $filename = "gzip -c >> \"$filename\""; }
+          else
+            { die "Error, can't handle gzip compression with mode \"$mode\" for file \"filename\"\n"; }
+        } # if gzip compressed file
+      elsif ( $filename	=~ m/\.bz2$/ )
+       	{
+          if ( $mode =~ m/^>$/ ) # output mode
+            { $mode = "|-"; $filename = "bzip2 -c > \"$filename\""; }
+          elsif ( $mode =~ m/^<$/ ) # input mode
+            { $mode = "-|"; $filename = "bunzip2 -c \"$filename\""; }
+          else
+            { die "Error, can't handle bzip2 compression with mode \"$mode\" for file \"filename\"\n"; }
+       	}
+      open ( $fh, $mode, $filename ) or die ( "Error opening ${extratext}file \"$filename\" for $text: $!\n" );
+    }
+  # return the opened file handle to the caller
+  return $fh;
+} # sub stdopen
+
+
+
+###############################################################
+sub stdclose { my ( $fh ) = @_;
+###############################################################
+# same as built-in close, except in case of STDIN or STDOUT,
+# and in this case the file handle is not closed
+
+  unless ( fileno($fh) <= 2 )  # if file number is this low, is stdin or stdout or stderr
+    { close ( $fh ) or die ( "Error closing file handle: $!\n" ); }
+
+} # sub stdclose
+
+
+
+# eof
