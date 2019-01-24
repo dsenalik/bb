@@ -3,6 +3,8 @@
 #        Author: Douglas Senalik dsenalik@wisc.edu         #
 #----------------------------------------------------------#
 # "Black Box" program series
+# version 1.0 - June 8, 2015
+# version 2.0 - Jan 24, 2019 - --outfile can be used multiple times
 =bb
 This program parses output from a Shimadzu ELSD-LT RS232 serial port
 =cut bb
@@ -38,7 +40,7 @@ my $ansiup    = "\033[1A";  # terminal control
 (my $prognopath = $0) =~ s/^.*[\/\\]//;
 my $kpascale = 1;
 my $serial;  # input serial port handle
-my $OUTF;  # output file handle
+my @OUTF;  # output file handles
 
 
 
@@ -46,9 +48,9 @@ my $OUTF;  # output file handle
 # command line parameters
 ############################################################
 my $portname;            # serial port device
-my $outfilename;         # output file name, use \"-\" for stdout
-my $touchfilename;       # touch this file every time data is received
-my $noheader     = 0;    # inhibit header line in output
+my @outfilename;         # output file name, use \"-\" for stdout
+my @touchfilename;       # touch this file every time data is received
+my @noheader;            # inhibit header line in output
 my $append       = 0;    # append to existing output file
 my $psi;                 # scale pressure from kPa to psi
 my $help         = 0;    # print help and exit
@@ -56,9 +58,9 @@ my $quiet        = 0;    # only show errors
 my $debug        = 0;    # print extra debugging information
 GetOptions (
             "port=s"         => \$portname,          # string
-            "outfile=s"      => \$outfilename,       # string
-            "touch=s"        => \$touchfilename,     # string
-            "noheader"       => \$noheader,          # flag
+            "outfile=s"      => \@outfilename,       # string array
+            "touch=s"        => \@touchfilename,     # string array
+            "noheader"       => \@noheader,          # flag array
             "append"         => \$append,            # flag
             "psi"            => \$psi,               # flag
             "help"           => \$help,              # flag
@@ -67,8 +69,8 @@ GetOptions (
 # debug implies not quiet
 if ( $debug ) { $quiet = 0; }
 unless ( $portname ) { $help = 1 }
-unless ( $outfilename ) { $help = 1 }
-if ( ( $outfilename // '' ) eq "-" ) { $quiet = 1 }
+unless ( @outfilename ) { $help = 1 }
+if ( ( $outfilename[0] // '' ) eq "-" ) { $quiet = 1 }
 if ( $psi ) { $kpascale = $psiperkpa; }
 
 
@@ -85,18 +87,21 @@ an Evaporative Light-scattering Detector, Low Temperature,
 
 Required parameters:
   --port=xxx        RS232 serial port, e.g. /dev/ttyS0 or /dev/ttyUSB0
-  --outfile=xxx     output file name, use \"-\" for stdout
+  --outfile=xxx     output file name, use \"-\" for stdout, can be used
+                    multiple times
                     output format is tab-delimited with four columns:
                          date+time           gain  temperature  pressure
                     e.g. 2015/05/06 00:22:40	2	39	350
 Optional parameters:
-  --noheader        inhibit header line in output file
+  --noheader        inhibit header line in output file, use multiple
+                    times if using multiple --outfile
   --append          if --outfile exists, append to it rather
                     than overwrite. --noheader is automatically
                     applied if file exists and is not empty
   --psi             convert kPa to psi by mulitplying by $psiperkpa
   --touch=xxx       touch this file every time some data is received,
-                    file content will be the most recent reading
+                    file content will be the most recent reading, can
+                    be used multiple times
   --help            print this screen
   --quiet           inhibit warning messages
   --debug           print extra debugging information
@@ -120,18 +125,24 @@ $serial->stopbits($stopbits);
 $serial->read_const_time($readconsttime);
 $serial->read_char_time($readchartime);
 
-# initialize output file, $OUTF is global
-my $mode = '>';
-if ( $append )
+# initialize output file(s), @OUTF is global
+for my $i ( 0..$#outfilename )
   {
-    $mode = '>>';
-    if ( -s $outfilename ) { $noheader = 1; }
-  }
-debugmsg ( "Opening output file \"$outfilename\" mode \"$mode\"" );
-$OUTF = stdopen ( $mode, $outfilename );
-$OUTF->autoflush(1);  # disable buffering
-unless ( $noheader )
-  { print $OUTF join ( "\t", "Time", "Gain", "Temperature C", "Pressure ".($psi?'psi':'kPa') ), "\n"; }
+    my $mode = '>';
+    if ( $append )
+      {
+        $mode = '>>';
+        if ( -s $outfilename[$i] ) { $noheader[$i] = 1; }
+      }
+    debugmsg ( "Opening output file \"$outfilename[$i]\" mode \"$mode\"" );
+    $OUTF[$i] = stdopen ( $mode, $outfilename[$i] );
+    $OUTF[$i]->autoflush(1);  # disable buffering
+    unless ( $noheader[$i] )
+      {
+        my $OUT = $OUTF[$i];
+        print $OUT join ( "\t", "Time", "Gain", "Temperature C", "Pressure ".($psi?'psi':'kPa') ), "\n";
+      }
+  } # for $i
 }
 
 
@@ -154,7 +165,7 @@ while ( 1 )
         debugmsg ( "Received $serialchars characters \"$serialbuffer\"" );
         if ( $serialbuffer =~ m/Pressure/ )  # the last line of a record
           {
-            parsedata ( $serialbuffer, $OUTF );
+            parsedata ( $serialbuffer, @OUTF );
             $serialbuffer = '';
             $serialchars = 0;
           }
@@ -177,7 +188,7 @@ exit 0;
 
 
 ############################################################
-sub parsedata { my ( $buffer, $OUTF ) = @_;
+sub parsedata { my ( $buffer, @OUTF ) = @_;
 ############################################################
   debugmsg ( "Parsing data" );
   my $temp = 'MISSING';
@@ -224,14 +235,21 @@ sub parsedata { my ( $buffer, $OUTF ) = @_;
                           $pressure
                         )."\n";
       debugmsg ( "Saving record \"$record\"" );
-      print $OUTF $record;
-      if ( $touchfilename )
+      for my $i ( 0 .. $#OUTF )
         {
-          if ( $touchcontent )
-            { touch ( $touchfilename, $record ); }
-          else
-            { touch ( $touchfilename ); }
+          my $OUT = $OUTF[$i];
+          print $OUT $record;
         }
+      if ( @touchfilename )
+        {
+          for my $i ( 0 .. $#touchfilename )
+            {
+              if ( $touchcontent )
+                { touch ( $touchfilename[$i], $record ); }
+              else
+                { touch ( $touchfilename[$i] ); }
+            }
+        } # if ( @touchfilename )
     }
   else
     {
