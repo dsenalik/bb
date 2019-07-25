@@ -6,6 +6,7 @@
 # "Black Box" program series
 # version 1 2016-03-08 initial commit
 # version 2 2019-02-04 Add --barcodefile, --column, and --gzlevel
+# version 3 2019-07-25 Add --force
 =bb
 Add barcodes to reverse reads for Tassel GBS pipeline
 =cut bb
