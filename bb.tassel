@@ -42,6 +42,7 @@ my $barcodefilename;     # optional file with barcodes, one per line
 my $barcodecolumn = 1;   # if using --barcodefile
 my @overhangs;
 my $gzlevel      = 9;    # gzip compression level, default to best compression
+my $force;               # used to overwrite existing output files
 my $help         = 0;    # print help and exit
 my $quiet        = 0;    # only show errors
 my $debug        = 0;    # print extra debugging information
@@ -52,6 +53,7 @@ GetOptions (
             "overhang=s"     => \@overhangs,         # string
             "barcodefile=s"  => \$barcodefilename,   # string
             "column=i"       => \$barcodecolumn,     # integer
+            "force"          => \$force,             # flag
             "gzlevel=i"      => \$gzlevel,           # integer
             "help"           => \$help,              # flag
             "quiet"          => \$quiet,             # flag
@@ -99,6 +101,7 @@ Optional parameters:
   --barcodefile=xxx specify a custom set of barcodes
   --column=xxx      which column within file --barcodefile
                     contains the barcode, default=1 (1-based)
+  --force           overwrite output files if they exist
   --gzlevel=xxx     gzip compression level, 1(fast) to 9(best),
                     default=9
   --help            print this screen
@@ -114,6 +117,8 @@ Optional parameters:
 # initialization
 ############################################################
 init();
+if ( ( -s $outfilename ) and ( ! $force ) )
+  { die "Output file \"$outfilename\" exists, aborting. Use --force to override\n"; }
 
 
 
