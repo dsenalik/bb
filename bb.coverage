@@ -18,7 +18,8 @@ use File::Temp  qw/ tempfile /;
 #                             other tools. Specifically, coverage is now computed for
 #                             the intervals in the A file based on the overlaps with
 #                             the B file, rather than vice versa"
-# version 1.2  Dec 8, 2019  - Sys::CPU no longer in CPAN, replaced with Unix::Processors
+# version 1.2  Dec 8, 2019  - Sys::CPU no longer in CPAN, replaced with Unix::Processors,
+#                             and add --noenhanced and --oneplot flags
 
 
 
@@ -80,6 +81,7 @@ my $calccoverage = 0;         # 1 if need to calculate coverage by blast. 0 if u
 my %persequencemarkers;       # from --parse procesing
 my $orfdata = "";             # gnuplot commands for displaying orfs, insert into command file directly
 my $permanentdb = 0;          # true when using precompiled blast database
+my @mergedlabels;             # labels when using --oneplot
 my $coverageby;
 my $objcounter = 0;
 
@@ -112,6 +114,7 @@ my $pctmin         = $defaultpctmin;    # minimum blast hit percent match
 my $evalue         = $defaultevalue;    # e-value used for blast search
 my $font           = $defaultpngfont;
 my $format         = $defaultformat;    # graph file format, e.g. "png"
+my $noenhanced;                         # toggle for gnuplot noenhanced vs. enhanced
 my $xsize          = $defaultxsize;     # plot width
 my $ysize          = $defaultysize;     # plot height
 my $xlabel         = $defaultxlabel;
@@ -129,6 +132,7 @@ my $nolegend;              # no legend
 my $leftcrop       = 0;
 my $rightcrop      = 0;
 my $thumbnail      = 0;    # make a thumbnail at this scale
+my $oneplot;               # all sequences on one plot
 my $gc;                    # plot percent gc if defined, if value use that window size
 my $transform;             # experimental
 my $fill;
@@ -163,6 +167,8 @@ GetOptions (
             "cpu=i"          => \$numcpu,            # integer
             "html=s"         => \$htmlname,          # string
             "format=s"       => \$format,            # string
+            "noenhanced"     => \$noenhanced,        # flag
+            "oneplot"        => \$oneplot,           # flag
             "font=s"         => \$font,              # string
             "xsize=s"        => \$xsize,             # string (real)
             "xtics=s"        => \$xtics,             # string (real)
@@ -300,7 +306,9 @@ Optional parameters:
   --wigname=xxx     use to override default wiggle file name, --wiggle still
                     required. If contains no path, --outpath is prepended
   --wigheadername=xxx  This is the name used in the wiggle file header
+  --oneplot         concatenate all sequences onto one plot
   --format=xxx      image file format for graphs, default=\"$defaultformat\"
+  --noenhanced      disable the gnuplot interpretation of underscore as subscript
   --xsize=xxx       plot width, default=$xsize
   --ysize=xxx       plot height, default=$ysize
   --xscale=xxx      alternative to xsize, to make image
@@ -1002,6 +1010,36 @@ if ( $showorfs )
 
 
 ############################################################
+# merge data if creating one plot
+############################################################
+if ( $oneplot )
+  {
+    my @newvalues;
+    for my $i ( 0 .. $#refhdrkeys )
+      {
+        # --grep filtering
+        my $skip = 0;
+        if ( @greps )
+          {
+            $skip = 1;
+            foreach my $grep ( @greps )
+              { if ( $refhdrkeys[$i] eq $grep ) { $skip = 0; last; } }
+          }
+        next if ( $skip );
+        # label and start point
+        push( @mergedlabels, [ $refhdrkeys[$i], scalar(@newvalues) ] );
+        for my $j ( 1..$reflengths[$i] )
+          { push( @newvalues, $coverage[$i]->[$j] ); }
+      } # for $i
+    # overwrite original individual sequences with merged values
+    @refhdrkeys = ( 'merged' );
+    @coverage = ( \@newvalues );
+    @reflengths = ( $#newvalues );
+  } # if $oneplot
+
+
+
+############################################################
 # create a graph from stored data
 ############################################################
 unless ( $noimage )
@@ -1072,7 +1110,7 @@ for my $i ( 0 .. $#refhdrkeys )
 
     # create gnuplot command file
     $objcounter = 0;
-    print $OUTG "set terminal $format size $xsize,$ysize font \"$font\"\n";
+    print $OUTG "set terminal $format ".($noenhanced?'no':'')."enhanced size $xsize,$ysize font \"$font\"\n";
     # background color just in plot area
     print $OUTG "set output \"$imagefile\"\n";
     print $OUTG "set obj ",++$objcounter," rect from graph 0,0 to graph 1,1 fs solid 1.0 fc rgb \"$plotareabg\" behind\n";
@@ -1166,6 +1204,19 @@ for my $i ( 0 .. $#refhdrkeys )
               }
           }
       } # marker labels
+
+    # insert --oneplot labels if present
+    if ( @mergedlabels ) 
+      {
+        foreach my $aseqref ( @mergedlabels )
+          {
+            $objcounter++;
+            print $OUTG "set arrow $objcounter from $aseqref->[1], graph 0 to $aseqref->[1], graph 1",
+                        " nohead lc rgb \"$defaultmarkercolor\"\n";
+            my $markerlabely = sprintf ( "%1d", ( $plotymax * ( .90 - (0.05 * $markerlabeloffset) ) ) );
+            print $OUTG "set label $objcounter \"$aseqref->[0]\" at $aseqref->[1],$markerlabely front\n";
+          }
+      } # --oneplot labels
 
     print $OUTG $orfdata;
 
