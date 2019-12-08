@@ -56,7 +56,9 @@ foreach my $abb ( @bb )
     
     # print program name and description if one was found
     ( my $namenopath = $abb ) =~ s|^.*/||;
-    print "$namenopath\n", $info;
+    my $location = "unpublished";
+    if ( $abb =~ m|/usr/local/bb/| ) { $location = "published at GitHub"; }
+    print "$namenopath   $location\n", $info;
 
   } # foreach @bb
 
