@@ -5,6 +5,7 @@
 # "Black Box" program series
 # version 1.0 - September 12, 2014
 # version 1.1 - October 24, 2016 - --trim performed before grep searching
+# version 1.2 - January 30, 2020 - --exact added
 =bb
 Search and return sequences from FASTA or FASTQ files based on matches
 to one or more queries to text in the header line. Also can do search
@@ -45,6 +46,7 @@ my $greptrim;
 my $grepcolumn  = $defaultgrepcolumn;
 my $returncount = 0;    # program return code is number of hits
 my $trim        = 0;    # trim all FASTA header after first white space
+my $exact       = 0;    # full match to sequence id
 my $fastq       = 0;
 my $invert      = 0;
 my $append      = 0;
@@ -67,6 +69,7 @@ GetOptions (
             "grepcolumn=i"   => \$grepcolumn,        # integer
             "returncount"    => \$returncount,       # flag
             "trim"           => \$trim,              # flag
+            "exact"          => \$exact,             # flag
             "fastq"          => \$fastq,             # flag
             "v"              => \$invert,            # flag
             "raw"            => \$raw,               # flag
@@ -124,6 +127,10 @@ Optional parameters:
                     sequences returned, otherwise it is 0 for success
   --trim            trim all FASTA/Q headers after the first white space
                     prior to grep
+  --exact           grep expression must fully match entire sequence id from
+                    start to first white space. e.g. \"23\" will now match
+                    \">23 abc\" but not \">123 abc\". Internally this
+                    sets --trim and adds ^ and \$ around the grep expression
   --v               invert the search, only return non-hits (like grep -v)
   --append          append results to existing --outfile
   --raw             do not return headers, only sequence is output
@@ -227,6 +234,18 @@ if ( $debug )
   {
     foreach my $agrep ( @grep )
       { debugmsg ( "grep expression is \"$agrep\""); }
+  }
+
+
+
+############################################################
+# processing for --exact
+############################################################
+if ( $exact )
+  {
+    $trim = 1;  # removes white space and following so that only sequence id is matched
+    foreach my $agrep ( @grep )
+      { $agrep = '^' . $agrep . '$'; }
   }
 
 
