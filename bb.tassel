@@ -132,13 +132,18 @@ my $FOUTF = stdopen ( ">", $outfilename );
 my $ROUTF = $FOUTF;  # for future, in case want non-interleaved file
 my $nfound = 0;
 my $nnotfound = 0;
+my $nlines = 0;
 while ( ! eof $FINF )
   {
     my @flines;
     my @rlines;
-    # no error checking here in case either file ends prematurely
     for my $i ( 0..3 )
       {
+        # if either file ends prematurely, it is probably corrupted, so stop with error
+        if ( eof $FINF )
+          { die "Error, premature ending of forward file line ".($nlines+$i)." \"$finfilename\"\n"; }
+        if ( eof $RINF )
+          { die "Error, premature ending of reverse file line ".($nlines+$i)." \"$rinfilename\"\n"; }
         ( $flines[$i] = <$FINF> ) =~ s/[\r\n]//g;
         ( $rlines[$i] = <$RINF> ) =~ s/[\r\n]//g;
       }
@@ -170,6 +175,8 @@ while ( ! eof $FINF )
       }
     else # forward read lacking any known barcode+enzyme, discard both F and R reads
       { $nnotfound++; }
+
+    $nlines += 4;
 
   } # while <$INF>
 stdclose ( $FOUTF );
