@@ -7,12 +7,14 @@
 # version 1 2016-03-08 initial commit
 # version 2 2019-02-04 Add --barcodefile, --column, and --gzlevel
 # version 3 2019-07-25 Add --force
+# version 4 2022-04-09 Add --directory and --parallel
 =bb
 Add barcodes to reverse reads for Tassel GBS pipeline
 =cut bb
 use strict;
 use warnings;
 use Getopt::Long;      # for getting command line parameters
+use POSIX ":sys_wait_h";  # to define WNOHANG constant
 
 
 
@@ -36,11 +38,14 @@ my $overhanglength;
 ############################################################
 # command line parameters
 ############################################################
+my $directory;           # process entire directory
+my $parallel     = 4;    # process this many in parallel
 my $finfilename  = "";   # input file name
 my $rinfilename  = "";   # input file name
 my $outfilename  = "";   # output file name
 my $barcodefilename;     # optional file with barcodes, one per line
 my $barcodecolumn = 1;   # if using --barcodefile
+my $bcset        = 1;    # predefined barcode set number
 my @overhangs;
 my $gzlevel      = 9;    # gzip compression level, default to best compression
 my $force;               # used to overwrite existing output files
@@ -48,14 +53,17 @@ my $help         = 0;    # print help and exit
 my $quiet        = 0;    # only show errors
 my $debug        = 0;    # print extra debugging information
 GetOptions (
+            "directory=s"    => \$directory,         # string
             "finfile=s"      => \$finfilename,       # string
             "rinfile=s"      => \$rinfilename,       # string
             "outfile=s"      => \$outfilename,       # string
             "overhang=s"     => \@overhangs,         # string
             "barcodefile=s"  => \$barcodefilename,   # string
+            "bcset=i"        => \$bcset,             # integer
             "column=i"       => \$barcodecolumn,     # integer
             "force"          => \$force,             # flag
             "gzlevel=i"      => \$gzlevel,           # integer
+            "parallel=i"     => \$parallel,          # integer
             "help"           => \$help,              # flag
             "quiet"          => \$quiet,             # flag
             "debug"          => \$debug);            # flag
@@ -67,7 +75,7 @@ if ( ( $finfilename ) or ( $rinfilename ) or ( $outfilename ) )
     unless ( $rinfilename ) { print "Error, --rinfile not specified\n"; $help = 1; }
     unless ( $outfilename ) { print "Error, --outfile not specified\n"; $help = 1; }
   }
-else
+elsif ( !$directory )
   { $help = 1; }
 unless ( @overhangs ) { @overhangs = @defaultoverhangs; }
 if ( $outfilename eq "-" ) { $quiet = 1 }
@@ -88,17 +96,24 @@ since TASSEL cannot otherwise identify the reverse reads which
 do not have a barcode.
 
 Required parameters:
+  either
   --finfile=xxx     input FASTQ file name of forward reads,
                     can be gzip compressed if .gz extension
   --rinfile=xxx     input FASTQ file name of reverse reads,
   --outfile=xxx     output file name, compressed if .gz extension
                     or use - for STDOUT
+  or
+  --directory=xxx   process all read pairs in this directory
 Optional parameters:
+  --parallel=xxx    when using --directory, process up to this
+                    many pairs of reads files in parallel,
+                    default is 4
   --overhang=xxx    sequence(s) of restriction enzyme
                     overhang, e.g. for ApeKI (this is the
                     default), use --overhang twice:
                     --overhang=CAGC --overhang=CTGC
                     they must all be the same length
+  --bcset=xxx       predefined barcode set, 1 (default) or 2
   --barcodefile=xxx specify a custom set of barcodes
   --column=xxx      which column within file --barcodefile
                     contains the barcode, default=1 (1-based)
@@ -118,14 +133,34 @@ Optional parameters:
 # initialization
 ############################################################
 init();
+
+my $r;
+if ( $directory )
+  {
+    $r = processdirectory( $directory, $parallel, $force );
+  }
+else
+  {
+    $r = processreads( $finfilename, $rinfilename, $outfilename, $force );
+  }
+
+
+
+############################################################
+# cleanup and end program
+############################################################
+exit $r;
+
+
+
+############################################################
+sub processreads { my ( $finfilename, $rinfilename, $outfilename, $force ) = @_;
+############################################################
 if ( ( -s $outfilename ) and ( ! $force ) )
-  { die "Output file \"$outfilename\" exists, aborting. Use --force to override\n"; }
-
-
-
-############################################################
-# Process reads
-############################################################
+  {
+    print "Warning, output file \"$outfilename\" exists, not processing. Use --force to override\n";
+    return 1;
+  }
 my $FINF = stdopen ( "<", $finfilename );
 my $RINF = stdopen ( "<", $rinfilename );
 my $FOUTF = stdopen ( ">", $outfilename );
@@ -184,13 +219,80 @@ stdclose ( $RINF );
 stdclose ( $FINF );
 unless ( $quiet ) { print "Found " . commify($nfound) . " read pairs with barcodes, "
                     . commify($nnotfound) . " pairs without barcodes discarded\n"; }
+} # sub processreads
 
 
 
 ############################################################
-# cleanup and end program
+sub processdirectory { my ( $directory, $parallel, $force ) = @_;
 ############################################################
-exit 0;
+# the assumption is that reverse reads files are identical to forward except
+# that _R1_ is replaced with _R2_, and for output _R1_ is replaced with _tassel_
+my @fwdreads = glob( $directory . '/*_R1_*.fastq*' );
+push( @fwdreads, glob( $directory . '/*_R1_*.fq*' ) );
+unless ( @fwdreads )
+  {
+    print "Error, no files found in \"$directory\" matching *_R1_*.fastq* or *_R1*.fq*\n";
+    return 1;
+  }
+
+my @pids;
+my $i = 0;  # for debug message
+foreach my $finfilename ( @fwdreads )
+  {
+    $i++;
+    # this regex pattern is guaranteed to be in the name based on the glob
+    (my $rinfilename = $finfilename ) =~ s|_R1_|_R2_|;
+    (my $outfilename = $finfilename ) =~ s|_R1_|_tassel_|;
+
+    # limit number of concurrent processes
+    while ( countchildren(@pids) >= $parallel )
+      { sleep(60); }
+
+    # split into threads
+    my $pid = fork();
+
+    if ( not defined $pid )
+      { die "Fork failed thread $i $!\n"; }
+    elsif ( $pid == 0 )  # i.e., child
+      {
+        debugmsg ( "Child $i starting \"$outfilename\" ".timestr() );
+        processreads( $finfilename, $rinfilename, $outfilename, $force );
+        debugmsg ( "Child $i finished \"$outfilename\" ".timestr() );
+        exit 0;
+      }
+    else  # parent
+      {
+        push ( @pids, $pid );
+        debugmsg ( "Launched child $i pid $pid \"$outfilename\" ".timestr() );
+        # short sleep so that if child fails immediately, we
+        # can avoid the longer sleep in the loop
+        sleep( 1 );
+      }
+  }
+
+# wait for all threads to finish
+debugmsg ( "Waiting for threads to finish ".timestr() );
+foreach ( @pids )
+  { waitpid ( $_, 0 ); }
+debugmsg ( "All threads finished ".timestr() );
+
+} # sub processdirectory
+
+
+
+###############################################################
+sub countchildren { my ( @pids ) = @_;
+###############################################################
+my $nrunning = 0;
+foreach my $pid ( @pids )
+  {
+    my $returncode = waitpid($pid, WNOHANG);
+    unless ( $returncode ) { $nrunning++; }
+  }
+debugmsg( "countchildren returns $nrunning" );
+return( $nrunning );
+} # sub countchildren
 
 
 
@@ -198,11 +300,11 @@ exit 0;
 sub init {
 ############################################################
 # initialize barcode array of hashes @bch from list of barcodes
-# the order of barcodes with @bc is not important
+# the order of barcodes within @bc is not important;
 # initializes global variables $overhanglength and @bch
 
-  # define the default barcodes
-  my @bc = qw / AACCGAGA ACAGGGAA ACGACTAC ACGTGGTA CCATGGGT CCGGATAT CGCCTTAT CGCGGAGA CGTGTGGT
+  # define the default barcode sets
+  my @bc1 = qw/ AACCGAGA ACAGGGAA ACGACTAC ACGTGGTA CCATGGGT CCGGATAT CGCCTTAT CGCGGAGA CGTGTGGT
                 GCTGTGGA GGATTGGT GTGAGGGT TAGCATGC TAGGCCAT TATCGGGA TCTCAGTC TGCAAGGA TGGTACGT TTCCTGGA
                 AAAAGTT AACGCCT AATATGC ACGTGTT ATGAAAC ATTAATT ATTGGAT CATAAGT CGCTGAT CGGTAGA CTACGGA
                 CTTGCTT GAACTTC GAATTCA GCGGAAT GGACCTA GTCGATT TAGCGGA TATTTTT TCGAAGA TCTGTGA TGCTGGA
@@ -211,10 +313,26 @@ sub init {
                 ACAAA ACCGT AGCCC AGGAT ATTGA CATCT CCTAC CGCTT CTAGC CTGTA GAGGA
                 GCTTA GGAAC GGTGT GTATT GTCAA TAATA TACAT TCACC TCGTT TGCGA TTCTC
                 AACT ACTA AGGC CAGA CGAT CTCC GATC GCGT GTAA TCAC TGCA /;
+  my @bc2 = qw/ TGCT TTGGCA CGCCAT CGCTCA CGTACC CTATGGA TACTGAT GTCTGAA TCAGTAT ACCGAGT GCAACGT
+                GCCAGAT CAGCT GATGTC GTCACT ACGCTC TTCAAGT TACGGTA CTTGAGA ATCAGTT GTTACGA ATGTCAA
+                ATAGTCA CCAGGTA GACTC TGTTAC CATCGC CTGATC GAGCAGT ACTATGT GATCATA TGTGCAA TGCATAT
+                GGTGGCA TAGCCAT TGGCAAC ACGTC TGACCT AGGTCT CCAGTC ACACGGT CGTGAAT GCATTGA CGACAGT
+                AGTTCGA TCGTTAA AGGAGTC ATGATCT CACGTT TTGCAC CCTGCA TACGCC GACGTGA AACTTGT CAGGTAT
+                ACGTGTA ACGCTGA TGATCAT GTAGAGC CATGTTA GTTAGC CTAGCT ACCTGC CCGTAC TCATAGT TGACGTA
+                TGCAATA GATGCAT TAAGCTT CGTCGGA GACCTAT TGTAAGC AGCATT TAGTGC CTTGAC TCGACC TTACGAT
+                GCTATAA ATATCGT CTAATGT CTTAGAT GACTATT ATTAGCA GGACCTT CTCCGA TGAATC GCTCAC GCATCC
+                GGCTAGA ATCGTAT AGTCTAT GCGTAAT TGATACA TAGGTCA TGTCATT GTGTACA /;
 
   # optional override of default barcodes with a file of barcodes
+  my @bc;
   if ( $barcodefilename )
     { @bc = loadbarcodefile( $barcodefilename, $barcodecolumn ); }
+  elsif ( $bcset == 1 )  # default
+    { @bc = @bc1; }
+  elsif ( $bcset == 2 )
+    { @bc = @bc2; }
+  else
+    { die "No barcode file, or set is invalid\n"; }
 
   # check that all --overhang parameters are the same length
   $overhanglength = length($overhangs[0]);
@@ -224,7 +342,7 @@ sub init {
         { die "Error, all overhang sequences must be the same length\n"; }
     }
 
-  # initialize @bch barcode+enzyme lookup hashes
+  # initialize global @bch barcode+enzyme lookup hashes
   foreach my $abarcode ( @bc )
     {
       my $l = length($abarcode);
