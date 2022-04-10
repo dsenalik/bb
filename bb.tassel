@@ -227,12 +227,13 @@ unless ( $quiet ) { print "Found " . commify($nfound) . " read pairs with barcod
 sub processdirectory { my ( $directory, $parallel, $force ) = @_;
 ############################################################
 # the assumption is that reverse reads files are identical to forward except
-# that _R1_ is replaced with _R2_, and for output _R1_ is replaced with _tassel_
-my @fwdreads = glob( $directory . '/*_R1_*.fastq*' );
-push( @fwdreads, glob( $directory . '/*_R1_*.fq*' ) );
+# that _R1_ is replaced with _R2_, and for output _R1_001 is replaced with _tassel
+# or _R1_ is replaced with _tassel_
+my @fwdreads = glob( $directory . '/*_R1*.fastq*' );
+push( @fwdreads, glob( $directory . '/*_R1*.fq*' ) );
 unless ( @fwdreads )
   {
-    print "Error, no files found in \"$directory\" matching *_R1_*.fastq* or *_R1*.fq*\n";
+    print "Error, no files found in \"$directory\" matching *_R1*.fastq* or *_R1*.fq*\n";
     return 1;
   }
 
@@ -243,7 +244,8 @@ foreach my $finfilename ( @fwdreads )
     $i++;
     # this regex pattern is guaranteed to be in the name based on the glob
     (my $rinfilename = $finfilename ) =~ s|_R1_|_R2_|;
-    (my $outfilename = $finfilename ) =~ s|_R1_|_tassel_|;
+    (my $outfilename = $finfilename ) =~ s|_R1_\d+|_tassel|;
+    $outfilename =~ s|_R1_|_tassel_|;
 
     # limit number of concurrent processes
     while ( countchildren(@pids) >= $parallel )
