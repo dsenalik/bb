@@ -158,7 +158,8 @@ sub processreads { my ( $finfilename, $rinfilename, $outfilename, $force ) = @_;
 ############################################################
 if ( ( -s $outfilename ) and ( ! $force ) )
   {
-    print "Warning, output file \"$outfilename\" exists, not processing. Use --force to override\n";
+    unless ( $quiet )
+      { print "Warning, output file \"$outfilename\" exists, not processing. Use --force to override\n"; }
     return 1;
   }
 my $FINF = stdopen ( "<", $finfilename );
