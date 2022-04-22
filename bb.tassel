@@ -242,6 +242,9 @@ my @pids;
 my $i = 0;  # for debug message
 foreach my $finfilename ( @fwdreads )
   {
+    # exclude md5 checksum files that may have been picked up by the glob
+    next if ($finfilename =~ m|\.md5$|);
+
     $i++;
     # this regex pattern is guaranteed to be in the name based on the glob
     (my $rinfilename = $finfilename ) =~ s|_R1_|_R2_|;
