@@ -8,12 +8,14 @@
 # version 2 2019-02-04 Add --barcodefile, --column, and --gzlevel
 # version 3 2019-07-25 Add --force
 # version 4 2022-04-09 Add --directory and --parallel
+# version 5 2022-09-04 Add --outdirectory
 =bb
 Add barcodes to reverse reads for Tassel GBS pipeline
 =cut bb
 use strict;
 use warnings;
 use Getopt::Long;      # for getting command line parameters
+use File::Basename;
 use POSIX ":sys_wait_h";  # to define WNOHANG constant
 
 
@@ -39,6 +41,7 @@ my $overhanglength;
 # command line parameters
 ############################################################
 my $directory;           # process entire directory
+my $outdirectory;        # destination of process entire directory
 my $parallel     = 4;    # process this many in parallel
 my $finfilename  = "";   # input file name
 my $rinfilename  = "";   # input file name
@@ -54,6 +57,7 @@ my $quiet        = 0;    # only show errors
 my $debug        = 0;    # print extra debugging information
 GetOptions (
             "directory=s"    => \$directory,         # string
+            "outdirectory=s" => \$outdirectory,      # string
             "finfile=s"      => \$finfilename,       # string
             "rinfile=s"      => \$rinfilename,       # string
             "outfile=s"      => \$outfilename,       # string
@@ -105,6 +109,8 @@ Required parameters:
   or
   --directory=xxx   process all read pairs in this directory
 Optional parameters:
+  --outdirectory=xxx  when using --directory, destination for
+                    processed output files. Default is same directory
   --parallel=xxx    when using --directory, process up to this
                     many pairs of reads files in parallel,
                     default is 4
@@ -137,7 +143,7 @@ init();
 my $r;
 if ( $directory )
   {
-    $r = processdirectory( $directory, $parallel, $force );
+    $r = processdirectory( $directory, $outdirectory, $parallel, $force );
   }
 else
   {
@@ -225,7 +231,7 @@ unless ( $quiet ) { print "Found " . commify($nfound) . " read pairs with barcod
 
 
 ############################################################
-sub processdirectory { my ( $directory, $parallel, $force ) = @_;
+sub processdirectory { my ( $directory, $outdirectory, $parallel, $force ) = @_;
 ############################################################
 # the assumption is that reverse reads files are identical to forward except
 # that _R1_ is replaced with _R2_, and for output _R1_001 is replaced with _tassel
@@ -237,6 +243,9 @@ unless ( @fwdreads )
     print "Error, no files found in \"$directory\" matching *_R1*.fastq* or *_R1*.fq*\n";
     return 1;
   }
+# append slash if not present
+if ( $outdirectory )
+  { $outdirectory =~ s|/*$|/|; }
 
 my @pids;
 my $i = 0;  # for debug message
@@ -250,6 +259,8 @@ foreach my $finfilename ( @fwdreads )
     (my $rinfilename = $finfilename ) =~ s|_R1_|_R2_|;
     (my $outfilename = $finfilename ) =~ s|_R1_\d+|_tassel|;
     $outfilename =~ s|_R1_|_tassel_|;
+    if ( $outdirectory )
+      { $outfilename = $outdirectory . basename( $outfilename ); }
 
     # limit number of concurrent processes
     while ( countchildren(@pids) >= $parallel )
