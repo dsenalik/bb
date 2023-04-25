@@ -9,6 +9,7 @@
 # version 3 2019-07-25 Add --force
 # version 4 2022-04-09 Add --directory and --parallel
 # version 5 2022-09-04 Add --outdirectory
+# version 6 2023-04-25 Support overhang length other than 4, support longer barcodes
 =bb
 Add barcodes to reverse reads for Tassel GBS pipeline
 =cut bb
@@ -33,7 +34,9 @@ my @defaultoverhangs = ( "CAGC", "CTGC" );  # ApeKI
 my $ansiup    = "\033[1A";  # terminal control
 (my $prognopath = $0) =~ s/^.*[\/\\]//;
 my @bch;  # array of hashes for looking up barcode hits
-my $overhanglength;
+my $minbarcodelength;    # length of shortest barcode
+my $maxbarcodelength;    # length of longest barcode
+my $overhanglength;      # length of strings in overhangs
 
 
 
@@ -192,10 +195,9 @@ while ( ! eof $FINF )
 
     # find barcode
     my $bclength;
-    for my $i ( 8, 7, 6, 5, 4 )
+    for (my $i=$maxbarcodelength; $i>=$minbarcodelength; $i--)
       {
-
-        if ( $bch[$i]->{substr($flines[1],0,$i+4)} )
+        if ( $bch[$i]->{substr($flines[1],0,$i+$overhanglength)} )
           {
             $bclength = $i;
             last;
@@ -350,6 +352,14 @@ sub init {
     { @bc = @bc2; }
   else
     { die "No barcode file, or set is invalid\n"; }
+
+  # determine range in lengths of barcodes
+  foreach my $barcode (@bc)
+    {
+      my $l = length($barcode);
+      if (!defined($minbarcodelength) or $l < $minbarcodelength) { $minbarcodelength = $l; }
+      if (!defined($maxbarcodelength) or $l > $maxbarcodelength) { $maxbarcodelength = $l; }
+    }
 
   # check that all --overhang parameters are the same length
   $overhanglength = length($overhangs[0]);
