@@ -10,6 +10,7 @@
 # version 4 2022-04-09 Add --directory and --parallel
 # version 5 2022-09-04 Add --outdirectory
 # version 6 2023-04-25 Support overhang length other than 4, support longer barcodes
+# version 7 2024-06-03 Automatically generate an MD5 checksum file
 =bb
 Add barcodes to reverse reads for Tassel GBS pipeline
 =cut bb
@@ -55,6 +56,7 @@ my $bcset        = 1;    # predefined barcode set number
 my @overhangs;
 my $gzlevel      = 9;    # gzip compression level, default to best compression
 my $force;               # used to overwrite existing output files
+my $nochecksum   = 0;    # suppress generation of am MD5 checksum file when finished
 my $help         = 0;    # print help and exit
 my $quiet        = 0;    # only show errors
 my $debug        = 0;    # print extra debugging information
@@ -71,6 +73,7 @@ GetOptions (
             "force"          => \$force,             # flag
             "gzlevel=i"      => \$gzlevel,           # integer
             "parallel=i"     => \$parallel,          # integer
+            "nochecksum"     => \$nochecksum,        # flag
             "help"           => \$help,              # flag
             "quiet"          => \$quiet,             # flag
             "debug"          => \$debug);            # flag
@@ -129,6 +132,7 @@ Optional parameters:
   --force           overwrite output files if they exist
   --gzlevel=xxx     gzip compression level, 1(fast) to 9(best),
                     default=9
+  --nochecksum      suppress generation of an MD5 checksum file
   --help            print this screen
   --quiet           only print error messages
   --debug           print extra debugging information
@@ -226,7 +230,9 @@ while ( ! eof $FINF )
 stdclose ( $FOUTF );
 stdclose ( $RINF );
 stdclose ( $FINF );
-unless ( $quiet ) { print "Found " . commify($nfound) . " read pairs with barcodes, "
+unless ($nochecksum)
+  { generatemd5($outfilename); }
+unless ( $quiet ) { print "$outfilename: Found " . commify($nfound) . " read pairs with barcodes, "
                     . commify($nnotfound) . " pairs without barcodes discarded\n"; }
 } # sub processreads
 
@@ -312,6 +318,19 @@ foreach my $pid ( @pids )
 debugmsg( "countchildren returns $nrunning" );
 return( $nrunning );
 } # sub countchildren
+
+
+
+############################################################
+sub generatemd5 { my ($filename) = @_;
+############################################################
+  my $md5 = $filename . '.md5';
+  unless (-s $md5)
+    {
+      my $cmd = "md5sum \"$filename\" > \"$md5\"";
+      run($cmd);
+    }
+} # sub generatemd5
 
 
 
@@ -499,6 +518,25 @@ sub stdclose { my ( $fh ) = @_;
     { close ( $fh ) or die ( "Error closing file handle: $!\n" ); }
 
 } # sub stdclose
+
+
+
+############################################################
+sub run { my ( $command, $errorokay ) = @_;
+############################################################
+# Run a system command, but use bash. Perl by default uses sh.
+# Command may be piped multiple commands or redirected from or to files.
+  debugmsg( "Running command \"$command\"" );
+  my $result = system( 'bash', '-o', 'pipefail', '-c', $command );
+  if ( ( $result ) and ( ! $errorokay ) )
+    {
+      # exitvalue 141 can occur if piping to head or grep -q
+      my $exitvalue = $result >> 8;
+      my $signal = $result & 255;
+      die( "Error $exitvalue:$signal running command \"$command\"\n" );
+    }
+  return( $result );
+} # sub run
 
 
 
